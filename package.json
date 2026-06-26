@@ -1,0 +1,16 @@
+{
+  "name": "qwen-vts-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Qwen2.5-Coder (Ollama, full-GPU) agent that drives the vs-token-safer vs-search MCP tools.",
+  "bin": {
+    "qvts": "qwen-mcp-bridge.mjs"
+  },
+  "scripts": {
+    "agent": "node qwen-mcp-bridge.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}

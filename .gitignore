@@ -1,0 +1,23 @@
+# deps
+node_modules/
+
+# machine-specific generated config (contains local paths) — never commit
+qvts.config.json
+Modelfile.generated
+
+# runtime / test artifacts (may contain local paths + code identifiers)
+*.log
+*.log.out
+sse*.log
+err*.log
+dash*.log
+ollama-serve.log*
+
+# OMC / agent session state
+.omc/
+.claude/
+scratchpad/
+
+# os
+Thumbs.db
+.DS_Store

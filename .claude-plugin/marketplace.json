@@ -1,0 +1,11 @@
+{
+  "name": "qwen-vts",
+  "owner": { "name": "D4ANote" },
+  "plugins": [
+    {
+      "name": "qwen-vts-orchestrator",
+      "source": "./",
+      "description": "Local Qwen (Ollama) drives vs-token-safer's vs-search tools; Claude delegates cheap code-location to it. CLI + web dashboard (token-savings panel) + delegation-routing skill."
+    }
+  ]
+}
