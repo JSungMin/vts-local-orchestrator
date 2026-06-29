@@ -50,14 +50,55 @@ jobs:
           echo "New version: $NEW"
 
       - name: Commit, tag, push
+        id: commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .claude-plugin/plugin.json .claude-plugin/marketplace.json
           if git diff --cached --quiet; then
-            echo "No version change to commit."; exit 0
+            echo "No version change to commit."; echo "tagged=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
           git commit -m "chore(release): v${{ steps.bump.outputs.version }} [skip ci]"
           # annotated tag — `--follow-tags` only pushes annotated tags, not lightweight ones
           git tag -a "v${{ steps.bump.outputs.version }}" -m "v${{ steps.bump.outputs.version }}"
           git push origin HEAD:main --follow-tags
+          echo "tagged=yes" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release with categorized notes
+        if: steps.commit.outputs.tagged == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v${{ steps.bump.outputs.version }}"
+          # Range = previous tag .. the merge commit we just released (HEAD^ skips the bot's release commit).
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"
+          RANGE="HEAD^"; [ -n "$PREV" ] && RANGE="${PREV}..HEAD^"
+          # We squash-merge PRs, so the per-change conventional-commit subjects live as `* …` bullets in the
+          # squash commit BODY (not as separate subjects). Pull those; fall back to commit subjects otherwise.
+          SUBJECTS="$(git log "$RANGE" --no-merges --pretty=format:'%b' | sed -n 's/^\* //p')"
+          [ -z "$SUBJECTS" ] && SUBJECTS="$(git log "$RANGE" --no-merges --pretty=format:'%s')"
+          feat=""; fix=""; docs=""; chore=""; other=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            desc="$(printf '%s' "$line" | sed -E 's/^(feat|fix|docs|chore|ci|test|build|refactor|perf|style)(\([^)]*\))?!?: //')"
+            case "$line" in
+              feat*) feat="${feat}- ${desc}"$'\n' ;;
+              fix*) fix="${fix}- ${desc}"$'\n' ;;
+              docs*) docs="${docs}- ${desc}"$'\n' ;;
+              chore*|ci*|test*|build*|refactor*|perf*|style*) chore="${chore}- ${desc}"$'\n' ;;
+              *) other="${other}- ${line}"$'\n' ;;
+            esac
+          done <<< "$SUBJECTS"
+          : > notes.md
+          [ -n "$feat" ]  && printf '### 🚀 Features\n%s\n' "$feat"  >> notes.md
+          [ -n "$fix" ]   && printf '### 🐛 Bug Fixes\n%s\n' "$fix"  >> notes.md
+          [ -n "$docs" ]  && printf '### 📝 Documentation\n%s\n' "$docs" >> notes.md
+          [ -n "$chore" ] && printf '### 🔧 Maintenance\n%s\n' "$chore" >> notes.md
+          [ -n "$other" ] && printf '### Other\n%s\n' "$other" >> notes.md
+          [ -n "$PREV" ]  && printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GITHUB_REPOSITORY" "$PREV" "$TAG" >> notes.md
+          if [ -s notes.md ]; then
+            gh release create "$TAG" --notes-file notes.md --title "$TAG"
+          else
+            gh release create "$TAG" --generate-notes --title "$TAG"
+          fi
