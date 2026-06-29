@@ -73,13 +73,16 @@ PROJECT="${1:-}"
 if [ -z "$PROJECT" ] && [ -f "$HOME/.vs-token-safer/config.json" ]; then
   PROJECT="$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync(process.env.HOME+'/.vs-token-safer/config.json','utf8')).projectPath||'')}catch{}")"
 fi
-VARIANT="$VARIANT" node -e "
-const fs=require('fs');
-const cfg={model:process.env.VARIANT,numCtx:${CTX},maxSteps:25,
-  vtsServer:'${VTS_SERVER}',project:'${PROJECT}'||null,clangd:null,
-  port:7878,ollamaHost:'http://127.0.0.1:11434',ramGB:${RAM_GB},tier:'Apple Silicon ${TIER} (macOS Metal)'};
-fs.writeFileSync('${HERE}/qvts.config.json',JSON.stringify(cfg,null,2)+'\n');
-"
+# Pass every value through the ENV (never spliced into the JS source) so a path/tier with a quote or
+# newline can't break out of the string and execute arbitrary code in the setup process.
+QV_VARIANT="$VARIANT" QV_CTX="$CTX" QV_VTS="$VTS_SERVER" QV_PROJECT="$PROJECT" \
+QV_RAM="$RAM_GB" QV_TIER="$TIER" QV_HERE="$HERE" node -e '
+const fs=require("fs"), e=process.env;
+const cfg={model:e.QV_VARIANT,numCtx:Number(e.QV_CTX),maxSteps:25,
+  vtsServer:e.QV_VTS,project:e.QV_PROJECT||null,clangd:null,
+  port:7878,ollamaHost:"http://127.0.0.1:11434",ramGB:Number(e.QV_RAM),
+  tier:"Apple Silicon "+e.QV_TIER+" (macOS Metal)"};
+fs.writeFileSync(e.QV_HERE+"/qvts.config.json",JSON.stringify(cfg,null,2)+"\n");'
 say "wrote qvts.config.json (model: ${VARIANT}, target: ${PROJECT:-<none — set VTS_PROJECT>})"
 
 # ---- 6. verify ----
