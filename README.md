@@ -2,6 +2,10 @@
 
 > **Claude + any local LLM + [vs-token-safer](https://github.com/JSungMin/vs-token-safer)**, as one code-navigation pipeline.
 
+<p align="center">
+  <img src="docs/how-it-works.svg" alt="How it works: Claude delegates bulk code-location and reading to a free local model (gemma4:e4b on Ollama) that drives vs-search; only the compact file:line answer returns to Claude, so Claude pays ~6–20% of the tokens." width="900">
+</p>
+
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-7C3AED)](https://code.claude.com/docs/en/plugins)
 [![MCP](https://img.shields.io/badge/MCP-client-1f6feb)](https://modelcontextprotocol.io)
 [![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-000000)](https://ollama.com)
