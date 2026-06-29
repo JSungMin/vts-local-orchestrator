@@ -22,7 +22,7 @@
  */
 // NOTE: @modelcontextprotocol/sdk is imported DYNAMICALLY inside main() (after ensureDeps), never as a
 // top-level static import — so a fresh plugin install with no node_modules self-heals instead of crashing.
-import { ensureDeps } from "./scripts/ensure-deps.mjs";
+import { ensureDeps, depsPresent } from "./scripts/ensure-deps.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -462,6 +462,42 @@ function parseToolCallsFromText(content, validNames) {
 const THINK_ENV = process.env.QVTS_THINK;
 const THINK = THINK_ENV === undefined ? undefined : /^(1|true|on|yes)$/i.test(THINK_ENV);
 const OLLAMA_TIMEOUT = Number(process.env.QVTS_OLLAMA_TIMEOUT || 180000); // abort a hung model call (esp. in the serialized daemon)
+
+// Preflight the local model BEFORE any work, so a down server or an empty model store fails with one
+// ACTIONABLE message instead of a bare "TypeError: fetch failed" surfacing from the first chat call (or a
+// confusing 404 when the model dir is wrong). Best-effort and conservative: we only throw on a DEFINITIVE
+// signal (unreachable host, or the host is up but the model is absent / no models at all). A check that
+// itself errors oddly is swallowed — we let the real call report it rather than block on a false negative.
+async function preflightOllama() {
+  let tags;
+  try {
+    const res = await fetch(`${OLLAMA_HOST}/api/tags`, {
+      signal: AbortSignal.timeout(Number(process.env.QVTS_PREFLIGHT_TIMEOUT || 4000)),
+    });
+    if (!res.ok) return; // server answered but oddly — let the real call surface it
+    tags = await res.json();
+  } catch (e) {
+    throw new Error(
+      `Ollama is not reachable at ${OLLAMA_HOST} (${e.message}). The local model drives every locate/digest, ` +
+        `so nothing runs until it is up. Start it with \`ollama serve\` (set OLLAMA_HOST if it listens elsewhere).`,
+    );
+  }
+  const names = (tags.models || []).map((m) => m.name);
+  const base = (n) => String(n).split(":")[0];
+  if (!names.length) {
+    throw new Error(
+      `Ollama is up at ${OLLAMA_HOST} but reports NO models (OLLAMA_MODELS=${process.env.OLLAMA_MODELS || "default store"}). ` +
+        `If your models live on another drive, set OLLAMA_MODELS to that path BEFORE \`ollama serve\` ` +
+        `(e.g. OLLAMA_MODELS=D:\\Ollama\\models), then restart it.`,
+    );
+  }
+  if (!names.includes(MODEL) && !names.some((n) => base(n) === base(MODEL))) {
+    throw new Error(
+      `Ollama is up at ${OLLAMA_HOST} but model "${MODEL}" is not present (have: ${names.join(", ")}). ` +
+        `Create/pull it, set QVTS_MODEL to one you have, or fix OLLAMA_MODELS if the store is on another drive.`,
+    );
+  }
+}
 
 async function ollamaChat(messages, tools) {
   const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
@@ -939,6 +975,12 @@ async function main() {
   const slimOne = (full) => (wantTrace ? full : { answer: full.answer, saved: full.savings ? full.savings.savedVsGrep : undefined });
   const slimBatch = (r) => (wantTrace ? r : { q: r.q, answer: r.answer, saved: r.savings ? r.savings.savedVsGrep : undefined });
 
+  // Preflight the local model for every path that USES it (i.e. all but the savings ledger — handled above —
+  // and a daemon stop/status query). Converts a later cryptic "fetch failed" / empty-model crash into one
+  // actionable line, before we spawn the vs-search server or hit the warm daemon. See preflightOllama().
+  const daemonQuery = sub === "daemon" && /^(stop|status)$/i.test(rawArgs[1] || "status");
+  if (!daemonQuery) await preflightOllama();
+
   // qvts digest <file|-> [--focus "..."]  — distill a big artifact into a compact brief.
   if (sub === "digest") {
     const fi = rawArgs.indexOf("--focus");
@@ -1211,6 +1253,26 @@ async function main() {
   }
   // Self-heal the one runtime dep, then dynamically load the SDK (see the import note at the top).
   await ensureDeps();
+
+  // The vs-search server is a SEPARATE package, spawned over stdio below. If ITS node_modules lacks the MCP
+  // SDK the child dies on launch and connect() throws a bare "MCP error -32000: Connection closed". The SDK
+  // is an OPTIONAL dependency in the server's package.json, so a plain install that omits optionals never
+  // places it — a fresh plugin install hits exactly this. Heal it from our node context (best-effort,
+  // one-time; depsPresent short-circuits once installed). Opt out with QVTS_NO_SERVER_SELFHEAL=1.
+  const SERVER_DIR = path.dirname(VTS_SERVER);
+  if (!/^(1|true|on|yes)$/i.test(process.env.QVTS_NO_SERVER_SELFHEAL || "") && !depsPresent(SERVER_DIR)) {
+    process.stderr.write(`[vts-local] vs-search server is missing the MCP SDK in ${SERVER_DIR} — installing it (one-time)…\n`);
+    try {
+      execSync("npm install @modelcontextprotocol/sdk --no-audit --no-fund --no-save --silent", {
+        cwd: SERVER_DIR,
+        stdio: ["ignore", "ignore", "inherit"],
+        timeout: Number(process.env.QVTS_DEP_INSTALL_TIMEOUT_MS || 300000),
+      });
+    } catch (e) {
+      process.stderr.write(`[vts-local] could not auto-install the server SDK (${e.message}). Run \`npm install\` in ${SERVER_DIR}.\n`);
+    }
+  }
+
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
   const transport = new StdioClientTransport({
@@ -1236,7 +1298,17 @@ async function main() {
     stderr: "inherit",
   });
   const client = new Client({ name: "vts-local-bridge", version: "0.1.0" }, { capabilities: {} });
-  await client.connect(transport);
+  try {
+    await client.connect(transport);
+  } catch (e) {
+    throw new Error(
+      `the vs-search server failed to start (${e.message}).\n` +
+        `  server: ${VTS_SERVER}\n` +
+        `  Its dependencies are likely missing — run \`npm install\` in ${SERVER_DIR}. It needs ` +
+        `@modelcontextprotocol/sdk, which is an OPTIONAL dep there, so a plain install can skip it ` +
+        `(auto-heal runs unless QVTS_NO_SERVER_SELFHEAL=1).`,
+    );
+  }
 
   // Expose only READ-ONLY LOCATOR tools to the local model. Edit tools (replace_symbol_body, insert_symbol,
   // rename, safe_delete) and vts_admin (gen_compile_db etc. — heavy / mutating) are withheld: a 14B model
@@ -1465,11 +1537,20 @@ async function main() {
     } else {
       process.stdout.write("\n" + out + "\n");
     }
-    // Hard-exit after a one-shot: client.close() asks the vs-search server to dispose clangd, but a busy
-    // clangd child can keep the event loop alive for minutes (observed rc=124 on big trees). Give close a
-    // brief grace, then force exit so the CLI always returns promptly.
-    await Promise.race([client.close().catch(() => {}), new Promise((r) => setTimeout(r, 1500))]);
-    process.exit(0);
+    // One-shot teardown. The answer is already on stdout. Dispose the vs-search server, then let the event
+    // loop drain NATURALLY so the child-stdio handles close exactly once → deterministic rc 0. The old code
+    // raced client.close() against a 1.5s timer and then called process.exit(0); because client.close() ends
+    // the child's stdin and waits up to ~2s for it to close, the timer routinely won and exit() ran *while*
+    // that handle was mid-close → on Windows libuv aborts (UV_HANDLE_CLOSING, async.c:76) with rc 127 despite
+    // a good answer (intermittent: only when the timer beat the close). client.close() already escalates
+    // stdin-EOF → SIGTERM → SIGKILL internally, so the server (and its clangd) dies and our pipes close on
+    // their own; awaiting it fully means no second teardown path racing the exit.
+    await client.close().catch(() => {});
+    // Safety net ONLY: if some handle somehow stays open (a wedged clangd grandchild), force a clean exit so
+    // the CLI never hangs. unref() so it NEVER keeps us alive — the normal path drains and exits 0 before
+    // this fires, with no forced exit and thus no double-close.
+    setTimeout(() => process.exit(0), Number(process.env.QVTS_EXIT_NET_MS || 5000)).unref?.();
+    return; // do NOT fall through to the REPL; the closed-client loop drains and the process exits 0
   }
 
   // REPL
