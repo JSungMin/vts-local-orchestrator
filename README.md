@@ -237,9 +237,10 @@ tooling (gamedev-log), not competing with them.
 - **Persistent savings ledger** — every delegation records what Claude *would* have spent vs what it
   actually received, to `~/.vts-local/savings.json`. Read it with **`qvts --savings`**; each `--json`
   response also carries a per-call `savings` object.
-- **Locate cache** — a repeated identical locate returns from `~/.vts-local/cache/` with **zero model
-  cost** (~16× faster). Invalidation: a git repo keys on `HEAD` (clean) and **isn't cached while dirty**;
-  a non-git target uses a TTL. Bypass with **`--no-cache`**.
+- **Cache** — a repeated identical locate returns from `~/.vts-local/cache/` with **zero model cost**
+  (~16× faster); a git repo keys on `HEAD` (not cached while dirty), a non-git target uses a TTL.
+  `digest`/`triage-diff` are **content-addressed** (keyed by the artifact's bytes → free on a re-run,
+  ~19× faster). Bypass any of it with **`--no-cache`**.
 - **Batch delegation** — **`qvts --batch '["q1","q2",…]'`** runs many locates over one warm connection +
   warm model (bounded `QVTS_CONCURRENCY`) and returns one `{results:[…]}` map. Payload: inline JSON, a file, or `-`.
 
