@@ -223,9 +223,12 @@ async function ollamaChatStream(messages, tools, onDelta) {
 // Connect MCP, filter to locator tools. Returns the agent handle.
 export async function createAgent({ onEvent = () => {} } = {}) {
   const project = readProjectPath();
-  const allowed = process.env.QVTS_TOOLS
-    ? new Set(process.env.QVTS_TOOLS.split(",").map((s) => s.trim()).filter(Boolean))
-    : DEFAULT_TOOLS;
+  // QVTS_TOOLS may only NARROW the read-only set (never grant edit/admin tools) unless QVTS_ALLOW_MUTATION=1.
+  const allowMutation = /^(1|true|on|yes)$/i.test(process.env.QVTS_ALLOW_MUTATION || "");
+  const requested = process.env.QVTS_TOOLS
+    ? process.env.QVTS_TOOLS.split(",").map((s) => s.trim()).filter(Boolean)
+    : [...DEFAULT_TOOLS];
+  const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
   if (!VTS_SERVER) throw new Error("vs-token-safer server path not found. Run setup.ps1, or set VTS_SERVER / vtsServer in qvts.config.json.");
   const transport = new StdioClientTransport({
