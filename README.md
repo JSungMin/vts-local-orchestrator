@@ -251,6 +251,12 @@ tooling (gamedev-log), not competing with them.
   Measured ~80–94 % fewer tokens than Claude reading the raw file.
 - **`qvts triage-diff [<file>|--staged|-]`** — the local model triages a git diff into JSON
   `{summary, hotspots, open}` so Claude opens only the flagged files (94 % smaller than the raw diff in testing).
+- **`qvts digest-dir <dir> [--focus "..."]`** — bounded walk of a directory; digests every text file (skips
+  node_modules/build/binaries, caps file count) into one **module brief** (per-file one-liner + an overview),
+  so Claude understands a module without reading its files. Per-file digests are content-cached + parallel.
+- **`qvts web <url> [--focus "..."]`** — fetch a URL, reduce HTML to text, digest locally → Claude gets a
+  brief instead of the whole page. ⚠ This makes an **outbound request to `<url>`** (it pulls public content
+  IN; no local code is sent out) — the only feature that touches the network beyond Ollama.
 - **Auto-distill hook** (opt-in, **not auto-registered**) — `hooks/steer-distill.js` nudges a large-file
   `Read` toward `qvts digest`. Wire it into your own `settings.json` (see the file header) and set
   `VTS_AUTO_DISTILL=1` (warn — recommended). `=block` is **risky** (Claude must Read before it can Edit, and
@@ -259,12 +265,16 @@ tooling (gamedev-log), not competing with them.
 
 **Performance:** model kept resident (`keep_alive`), and an optional **warm daemon**
 (**`qvts daemon start|stop|status`**) holds one hot vs-search index so repeat calls skip the per-call
-server spawn; the CLI auto-routes one-shots to it (`--no-daemon` to opt out).
+server spawn; the CLI auto-routes one-shots to it (`--no-daemon` to opt out). An opt-in **SessionStart
+hook** auto-starts the daemon for the session's repo when **`VTS_AUTO_DAEMON=1`** (off by default). The
+**dashboard** (`node dashboard.mjs`) shows an all-time savings panel from the ledger.
 
 ```bash
 qvts -p ./app --json "where is createSession declared"     # one locate (cached, ledgered)
 qvts -p ./app --batch '["find AuthService","callers of login","files named *.test.ts"]'   # many, one session
 qvts digest ./pr_body.md --focus "risks + which files to review"   # distill a big artifact
+qvts digest-dir ./src/auth --focus "the login flow"        # one brief for a whole module
+qvts web https://docs.example.com/api --focus "rate limits"  # fetch + digest a page (outbound to the URL)
 qvts -p ./app triage-diff --json                           # triage the working-tree diff
 qvts -p ./app daemon start                                 # keep the index warm across calls
 qvts --savings                                             # cumulative tokens saved
@@ -273,12 +283,17 @@ qvts --savings                                             # cumulative tokens s
 ## Configuration
 
 `config-loader.mjs` merges, low→high: **built-in defaults < `qvts.config.json` < `VTS_*`/`QVTS_*` env.**
-Commands: `qvts "<locate>"` · `qvts digest <file>` · `qvts triage-diff` · `qvts daemon start|stop|status` · `qvts --savings`.
+Commands: `qvts "<locate>"` · `digest <file>` · `digest-dir <dir>` · `web <url>` · `triage-diff` · `daemon start|stop|status` · `--savings`.
 Flags: `--json` · `-p/--project <repo>` · `--no-cache` · `--no-daemon` · `--batch <json|file|->` · `--focus "..."` · `--staged`.
 
 | Config key | Env var | Default | Meaning |
 | --- | --- | --- | --- |
 | `model` | `QVTS_MODEL` | `gemma4-vts` | Ollama model the bridge drives (must have `tools`). |
+| — | `QVTS_ALLOW_MUTATION` | off | `1` lets `QVTS_TOOLS` include edit/admin tools (default: read-only only). |
+| — | `QVTS_OLLAMA_TIMEOUT` | `180000` | Abort a hung model call (ms). |
+| — | `VTS_AUTO_DAEMON` | off | `1` = SessionStart hook auto-starts the warm daemon for the repo. |
+| — | `QVTS_DIR_MAX_FILES` / `QVTS_DIR_FILE_CHARS` | `40` / `16000` | `digest-dir` walk caps (files / per-file chars). |
+| — | `QVTS_WEB_TIMEOUT` / `QVTS_WEB_MAX` | `30000` / `2000000` | `web` fetch timeout (ms) / max response bytes. |
 | `numCtx` | `QVTS_NUM_CTX` | `16384` | Context window passed to Ollama. |
 | `maxSteps` | `QVTS_MAXSTEPS` | `25` | Tool-call rounds before the bridge gives up. |
 | `vtsServer` | `VTS_SERVER` | auto | Path to `vs-token-safer/server/index.js`. |
