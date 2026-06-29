@@ -1,0 +1,61 @@
+name: version-bump
+
+# Auto-bump the plugin version on every merge to main, in BOTH manifests, and tag it.
+# Bump level follows the (squash) commit type: feat → minor, `!`/BREAKING → major, else patch.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    # Don't loop on the bot's own release commit, and honor an explicit [skip ci].
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      !startsWith(github.event.head_commit.message, 'chore(release):') &&
+      !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Decide bump level from the commit type
+        id: level
+        run: |
+          MSG="$(git log -1 --pretty=%B)"
+          if printf '%s' "$MSG" | grep -qiE '(^|[[:space:]])[a-z]+(\([^)]*\))?!:|BREAKING[ -]CHANGE'; then
+            LEVEL=major
+          elif printf '%s' "$MSG" | grep -qiE '^feat(\([^)]*\))?:'; then
+            LEVEL=minor
+          else
+            LEVEL=patch
+          fi
+          echo "level=$LEVEL" >> "$GITHUB_OUTPUT"
+          echo "Bump level: $LEVEL"
+
+      - name: Bump version (plugin.json + marketplace.json)
+        id: bump
+        run: |
+          NEW="$(node scripts/bump.mjs ${{ steps.level.outputs.level }})"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "New version: $NEW"
+
+      - name: Commit, tag, push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .claude-plugin/plugin.json .claude-plugin/marketplace.json
+          if git diff --cached --quiet; then
+            echo "No version change to commit."; exit 0
+          fi
+          git commit -m "chore(release): v${{ steps.bump.outputs.version }} [skip ci]"
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin HEAD:main --follow-tags
