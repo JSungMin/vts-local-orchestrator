@@ -38,7 +38,8 @@ Pick the right tool:
 - raw strings/comments/config the index can't answer -> search_text.
 - search_text / find_files: NEVER pass a directory (or the project root) as \`path\` — it scopes to a single
   FILE, so a directory matches nothing. OMIT \`path\` to search the WHOLE tree; use \`glob\` ("*.h") to limit.
-- UNINDEXED C/C++: if search_symbol / document_symbols are NOT in your list, only find_files + search_text work:
+- UNINDEXED / NOT-YET-INDEXED C/C++: search_symbol / document_symbols may be ABSENT, or present but return
+  empty / "timed out" / error fast (index not ready). EITHER way, don't retry them — fall back:
   1) find_files for the likely file (class FooBar usually in FooBar.h; strip a UE prefix U/A/F/S/E for the name).
   2) search_text for the bare NAME as a SUBSTRING or regex \`class .*Name\` — NOT "class Name" (UE decls read
      \`class MODULE_API UName : public Base\`). Omit \`path\` (or glob "*.h"). The file:line returned IS the answer.
@@ -260,15 +261,23 @@ export async function createAgent({ onEvent = () => {} } = {}) {
     "search_symbol", "find_references", "goto_definition", "hover", "diagnostics",
     "document_symbols", "read_symbol", "concept_search",
   ]);
+  // AUTO-NARROW mode (default "soft" — see vts-bridge.mjs): soft = keep clangd tools but FAST-FAIL their
+  // queries (short LSP timeouts) so the model falls back to find_files/search_text; hard = drop them; off =
+  // keep them with normal long waits. Fast-fail/hard engage only on an UNUSABLE C/C++ index.
+  const NARROW_OFF = /^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
+  const NARROW_HARD = /^hard$/i.test(process.env.QVTS_AUTO_NARROW || "");
+  const INDEX_USABLE = clangdIndexUsable(project);
+  const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
+  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000");
+  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? (FAST_FAIL ? "2000" : "15000");
   const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
   let requested;
   if (toolsSpec) {
     requested = toolsSpec.split(",").map((s) => s.trim()).filter(Boolean);
   } else {
     requested = [...DEFAULT_TOOLS];
-    // AUTO-NARROW (general): drop clangd-dependent tools on a C/C++ project with no usable index (they hang).
-    const autoNarrow = !/^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
-    if (autoNarrow && !clangdIndexUsable(project)) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
+    // Only HARD mode drops the clangd-backed tools; SOFT/OFF keep them (soft relies on the short timeouts).
+    if (NARROW_HARD && !INDEX_USABLE) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
   }
   const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
@@ -276,7 +285,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [VTS_SERVER],
-    env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0", VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0", VTS_LSP_INDEX_WAIT_MS: process.env.VTS_LSP_INDEX_WAIT_MS ?? "15000" },
+    env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0", VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0", VTS_LSP_INDEX_WAIT_MS: LSP_INDEX_WAIT, VTS_LSP_TIMEOUT_MS: LSP_TIMEOUT },
     stderr: "ignore",
   });
   const client = new Client({ name: "vts-local-dashboard", version: "0.1.0" }, { capabilities: {} });

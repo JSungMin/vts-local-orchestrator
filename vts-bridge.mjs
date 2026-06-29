@@ -634,15 +634,16 @@ Pick the right tool:
 - search_text / find_files: do NOT pass a directory (and NEVER the project root) as \`path\`/\`dir\` — \`path\`
   scopes to a single FILE, so a directory matches NOTHING. OMIT \`path\` to search the WHOLE tree (the default);
   set it only to restrict to one known file. Use \`glob\` (e.g. "*.h") to limit by extension instead.
-- UNINDEXED C/C++ TREE: if search_symbol / document_symbols are NOT in your tool list, only find_files and
-  search_text work — use THIS chain and nothing else:
+- UNINDEXED / NOT-YET-INDEXED C/C++: search_symbol / document_symbols may be ABSENT from your tool list, OR
+  present but return empty / "timed out" / an error fast (the clangd index isn't ready). In EITHER case do
+  NOT retry them — fall back immediately to the index-free chain:
   1) find_files for the likely file (a class FooBar is usually in FooBar.h — for the FILENAME strip a leading
      UE type prefix U/A/F/S/E, so UMyClass -> "MyClass").
   2) search_text to pin the declaration line. Search the bare NAME as a SUBSTRING, or the regex
      \`class .*Name\` — NOT the exact string "class Name". UE declarations read
      \`class MODULE_API UName : public Base\`, so "class MyClass" finds nothing but "MyClass"
      (or \`class .*MyClass\`) matches \`class UMyClass\`. Omit \`path\` (or set glob "*.h").
-  The \`file:line\` that search_text returns IS the answer — report it; do NOT look for document_symbols.
+  The \`file:line\` that search_text returns IS the answer — report it.
 
 Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
 - When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
@@ -1064,6 +1065,30 @@ async function main() {
     process.stderr.write(`project: ${PROJECT}\nmodel:   ${MODEL}\n`);
   }
 
+  // AUTO-NARROW mode (default "soft"). On an UNINDEXED C/C++ tree the clangd-backed tools can't answer, so:
+  //   soft (default) → KEEP every tool exposed but make clangd queries FAIL FAST (short per-request +
+  //                    cold-warm bounds), so the model tries search_symbol, gets a quick empty, and falls
+  //                    back to find_files/search_text. Gains semantic results the instant an index IS ready.
+  //   hard           → drop the clangd-backed tools entirely (old behavior; zero wasted attempts).
+  //   off / 0        → keep every tool with the normal long waits (let clangd block until its index loads).
+  // clangdIndexUsable() is C/C++-specific and returns true for JS/TS/Python and indexed C/C++ — so fast-fail
+  // and hard-narrow only ever engage on an UNUSABLE C/C++ index; other languages are untouched.
+  const NARROW_OFF = /^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
+  const NARROW_HARD = /^hard$/i.test(process.env.QVTS_AUTO_NARROW || "");
+  const INDEX_USABLE = clangdIndexUsable(PROJECT);
+  const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
+  // Bounds passed to the vs-search spawn. VTS_LSP_TIMEOUT_MS caps EACH LSP request (clangd's per-query
+  // timeout — a slow/loading persisted index fails here); VTS_LSP_INDEX_WAIT_MS bounds the cold warm-up
+  // block. Short when fast-failing (~seconds, not 30s/120s); default otherwise. Explicit env always wins.
+  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000");
+  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? (FAST_FAIL ? "2000" : "15000");
+  if (FAST_FAIL) {
+    process.stderr.write(
+      `[vts-local] unindexed C/C++ — soft fast-fail (per-request ${LSP_TIMEOUT}ms): clangd tools are tried, ` +
+        `then fall back to find_files/search_text. QVTS_AUTO_NARROW=hard to drop them, =off to wait.\n`,
+    );
+  }
+
   // vs-token-safer default-prewarms (full background index) on every server spawn. The bridge spawns a
   // FRESH server per process, so leaving prewarm on would re-pay a full UE-tree index each run. vts already
   // indexes INCREMENTALLY/lazily on demand and persists to its db/, so we disable the eager prewarm and the
@@ -1088,10 +1113,12 @@ async function main() {
       // the same huge UE tree (double CPU/RAM) and makes symbol queries fail-fast (empty) instead of hanging
       // when no index exists yet. Override with VTS_CLANGD_BG_INDEX=1 (full) / safe to let it index too.
       VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0",
-      // SAFETY NET: bound how long a clangd query waits for its index. A huge UNSCOPED index can be built yet
-      // still slow to load/query — without a bound, search_symbol hangs minutes. 15s → if clangd can't answer,
-      // it returns empty and the model falls back to the index-free locators. Override via VTS_LSP_INDEX_WAIT_MS.
-      VTS_LSP_INDEX_WAIT_MS: process.env.VTS_LSP_INDEX_WAIT_MS ?? "15000",
+      // SAFETY NET: bound how long clangd work waits. VTS_LSP_INDEX_WAIT_MS = the cold warm-up block;
+      // VTS_LSP_TIMEOUT_MS = each individual LSP request (a slow/loading persisted index fails here). In soft
+      // fast-fail mode both are short (~seconds) so a not-ready clangd returns empty quickly and the model
+      // falls back to the index-free locators instead of hanging 30s/120s. See the NARROW mode block above.
+      VTS_LSP_INDEX_WAIT_MS: LSP_INDEX_WAIT,
+      VTS_LSP_TIMEOUT_MS: LSP_TIMEOUT,
     },
     stderr: "inherit",
   });
@@ -1134,12 +1161,14 @@ async function main() {
     requested = toolsSpec.split(",").map((s) => s.trim()).filter(Boolean);
   } else {
     requested = [...DEFAULT_TOOLS];
-    const autoNarrow = !/^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
-    if (autoNarrow && !clangdIndexUsable(PROJECT)) {
+    // Only HARD mode removes the clangd-backed tools. SOFT (default) keeps them and relies on the short
+    // LSP timeouts above to fast-fail; OFF keeps them with the normal long waits. (INDEX_USABLE / NARROW_HARD
+    // were computed before the spawn.)
+    if (NARROW_HARD && !INDEX_USABLE) {
       requested = requested.filter((n) => !INDEX_TOOLS.has(n));
       process.stderr.write(
-        `[vts-local] no clangd index for ${PROJECT} — exposing index-free locators only ` +
-          `(generate compile_commands.json or set QVTS_TOOLS to enable symbol search).\n`,
+        `[vts-local] QVTS_AUTO_NARROW=hard and no clangd index for ${PROJECT} — exposing index-free ` +
+          `locators only (generate compile_commands.json or set QVTS_TOOLS to enable symbol search).\n`,
       );
     }
   }
