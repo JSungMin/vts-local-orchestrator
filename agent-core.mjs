@@ -41,8 +41,12 @@ Pick the right tool:
 - Find a file by name -> find_files.
 - who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - raw strings/comments/config the index can't answer -> search_text.
-- search_text / find_files: NEVER pass a directory (or the project root) as \`path\` — it scopes to a single
-  FILE, so a directory matches nothing. OMIT \`path\` to search the WHOLE tree; use \`glob\` ("*.h") to limit.
+- search_text / find_files: NEVER pass a directory, the project root, or a GUESSED path as \`path\` — it scopes
+  to one FILE and a wrong path matches nothing. OMIT \`path\` for the whole tree; set it only to a file you saw
+  in a prior result. Use \`glob\` ("*.h") to limit; never invent directory paths.
+- CONSTRUCTOR of class X: it's \`X::X(\` in the .cpp. FIRST def_search name="X" to get the EXACT class name (UE
+  classes carry an A/U/F/S prefix — "Foo" is usually \`AFoo\`/\`UFoo\`, and the constructor uses that name), THEN
+  search_text q="<ExactName>::<ExactName>" with NO path. Don't guess the prefix or path.
 - DECLARATION hunt via search_text: ALWAYS search the DEFINITION pattern, not the bare name — \`class .*Name\` /
   \`struct .*Name\` for a type, \`Name\\s*\\(\` for a function (bare name floods with usages/#includes/comments
   and the time-box buries the declaration → false "no match"). Holds even for loose requests ("the game-instance
@@ -133,12 +137,14 @@ function sanitizeScopeArgs(name, args, project) {
   for (const k of PATH_ARGS) {
     const v = args[k];
     if (typeof v !== "string" || !v) continue;
-    let isDir = false;
+    let drop = false;
     try {
       const abs = path.isAbsolute(v) ? v : path.join(project || process.cwd(), v);
-      isDir = fs.statSync(abs).isDirectory();
-    } catch { /* glob/pattern — leave alone */ }
-    if (isDir) delete args[k];
+      if (fs.statSync(abs).isDirectory()) drop = true; // a dir scopes to nothing
+    } catch {
+      if (!/[*?[\]]/.test(v)) drop = true; // nonexistent + not a glob = a path the model invented → drop
+    }
+    if (drop) delete args[k];
   }
   return args;
 }

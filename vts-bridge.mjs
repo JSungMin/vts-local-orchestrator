@@ -340,16 +340,19 @@ function sanitizeScopeArgs(name, args) {
   for (const k of PATH_ARGS) {
     const v = args[k];
     if (typeof v !== "string" || !v) continue;
-    let isDir = false;
+    let drop = false, why = "";
     try {
       const abs = path.isAbsolute(v) ? v : path.join(PROJECT || process.cwd(), v);
-      isDir = fs.statSync(abs).isDirectory();
+      if (fs.statSync(abs).isDirectory()) { drop = true; why = "directory"; } // a dir scopes to nothing
     } catch {
-      /* not a real fs path (likely a glob/pattern) — leave it alone */
+      // path doesn't exist. A glob (`*.h`, `Source/**`) is still valid → keep it. Anything else is a path the
+      // model INVENTED (e.g. dropped a `Source/` segment) → drop it so the scan falls back to the whole tree
+      // instead of a guaranteed empty result.
+      if (!/[*?[\]]/.test(v)) { drop = true; why = "nonexistent"; }
     }
-    if (isDir) {
+    if (drop) {
       delete args[k];
-      process.stderr.write(`  · (drop directory ${k}="${v}" on ${name} → search whole tree)\n`);
+      process.stderr.write(`  · (drop ${why} ${k}="${v}" on ${name} → search whole tree)\n`);
     }
   }
   return args;
@@ -667,9 +670,15 @@ Pick the right tool:
 - Find a file by name -> find_files.
 - Who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - Raw strings/comments/config keys the symbol index can't answer -> search_text.
-- search_text / find_files: do NOT pass a directory (and NEVER the project root) as \`path\`/\`dir\` — \`path\`
-  scopes to a single FILE, so a directory matches NOTHING. OMIT \`path\` to search the WHOLE tree (the default);
-  set it only to restrict to one known file. Use \`glob\` (e.g. "*.h") to limit by extension instead.
+- search_text / find_files: do NOT pass a directory (and NEVER the project root or a GUESSED path) as
+  \`path\`/\`dir\` — \`path\` scopes to a single FILE, and a wrong path matches NOTHING. OMIT \`path\` to search the
+  WHOLE tree (the default); set it ONLY to a file path you saw in a previous result. Use \`glob\` (e.g. "*.h")
+  to limit by extension instead — never invent directory paths.
+- CONSTRUCTOR of a class X: a C++ constructor is \`X::X(\` in the .cpp (definition) or \`X(\` inside the class in
+  the .h (declaration). FIRST def_search name="X" to get the EXACT class name and file — UE classes carry an
+  A/U/F/S prefix (a class the user calls "Foo" is usually \`AFoo\`/\`UFoo\`), and the constructor uses that SAME
+  prefixed name. THEN search_text q="<ExactName>::<ExactName>" with NO path (whole tree) for the definition.
+  Don't guess the prefix or the path — read the real name out of the def_search result first.
 - DECLARATION hunt via search_text (no symbol index): ALWAYS search the DEFINITION pattern, never the bare
   name — \`class .*Name\` / \`struct .*Name\` / \`enum .*Name\` for a type, \`Name\\s*\\(\` for a function. The
   bare name floods with usages, #includes and comments, so on a big tree the time-box buries the one
