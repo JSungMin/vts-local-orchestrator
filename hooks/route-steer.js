@@ -33,6 +33,14 @@ const context = [
   "this plugin exists to save. Call vs-search directly ONLY when (a) the delegated answer is empty/no-match/error,",
   "(b) it's a trivial peek at a file you just edited, or (c) the task needs reasoning/review/edits.",
   "Writes/edits remain Claude's job.",
+  "",
+  "READING, not just locating — same rule for INGESTING text. To survey a module or summarize/assess a big",
+  "file (e.g. \"which handlers spew large output\", \"what does this file do\"), do NOT Read the whole file",
+  "into your context — delegate the READ so only a compact brief comes back:",
+  `  qvts digest "<file>" --focus "<question>"     → a brief (local model reads the file; you get the brief)`,
+  `  qvts digest-dir "<dir>" --focus "<question>"  → per-file briefs + an overview for a whole module`,
+  `  qvts triage-diff [--staged]                   → a git diff → {summary,hotspots,open}; open only flagged files`,
+  "Read a file directly only when you need its exact bytes to EDIT it, or for a small/just-edited file.",
 ].join("\n");
 
 process.stdout.write(JSON.stringify({

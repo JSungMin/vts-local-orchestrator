@@ -1,6 +1,6 @@
 ---
 name: qvts-orchestration
-description: Routing rules for delegating cheap, high-volume CODE-LOCATION work to a local Qwen (Ollama, full-GPU) that drives vs-token-safer's vs-search tools — so Claude spends tokens on reasoning, not raw search output. Use whenever you need to find MANY symbols/usages/files at once, survey a module, or want a private local search; the search raw stays in the local model and only a compact file:line answer returns to Claude.
+description: Routing rules for delegating cheap, high-volume CODE-LOCATION and FILE-READING work to a local Qwen (Ollama, full-GPU) that drives vs-token-safer's vs-search tools — so Claude spends tokens on reasoning, not raw search/file output. Use whenever you need to find symbols/usages/files (def_search/search), survey a module, or summarize/assess a big file or diff without reading it into context (qvts digest/digest-dir/triage-diff); the raw stays in the local model and only a compact brief returns to Claude.
 ---
 
 # Qwen ↔ vts delegation routing
@@ -19,6 +19,7 @@ session hint — that hint optimizes for vs-token-safer's own tool usage, not fo
 
 <delegation_rules>
 - **Delegate (DEFAULT)** for ANY code-location — single OR bulk — so Claude gets only the summary:
+  - **where is X declared/defined** → the model should call `def_search name="X"` (deterministic, language-aware definition regex; far better than a bare text scan)
   - find the declaration of a symbol/type/function (one, or many at once)
   - a symbol's usages / callers / references
   - survey/map a module or directory's symbols
@@ -43,6 +44,22 @@ session hint — that hint optimizes for vs-token-safer's own tool usage, not fo
 4. UE/C++ symbol & reference tools need a clangd compile DB (one-time `vts_admin gen_compile_db`); without it,
    delegate only `search_text` / `find_files` style locates, which need no clangd.
 </delegation_protocol>
+
+## Delegate READING too — not just locating
+
+The same token rule applies to INGESTING text, not only searching for it. When you'd otherwise `Read` a big
+file (or a whole module) just to survey/summarize/assess it — e.g. "which handlers spew large output", "what
+does this file do", "where's the risk in this diff" — DON'T pull the raw bytes into your context. Delegate the
+READ; only a compact brief returns:
+
+- `qvts digest "<file>" --focus "<question>"` → shortest faithful brief (the local model reads the file).
+- `qvts digest-dir "<dir>" --focus "<question>"` → per-file briefs + an overview for a whole module.
+- `qvts triage-diff [--staged]` → a git diff → `{summary, hotspots[], open[]}` so you open only flagged files.
+
+All are content-cached and credit the savings ledger. `Read` a file directly only when you need its exact
+bytes to EDIT it, or it's small / just-edited (already in context). This is the "delegate reading, not just
+searching" axis — the most common missed save is Claude reading a 1–10k-line source file to answer a question
+a 3-second local `digest` could.
 
 Prereq: setup has run (`setup-macos.sh` on macOS/Linux, `setup.ps1` on Windows) — the configured model
 (`gemma4-vts` by default) loaded (`ollama ps` → 100% GPU) and `qvts.config.json` written. See ORCHESTRATION.md / USAGE.md.
