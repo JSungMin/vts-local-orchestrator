@@ -176,8 +176,24 @@ ollama create my-vts -f Modelfile.my        # FROM <base> + temperature 0.15 + n
 
 The model must have the `tools` capability (`ollama show <model>` → Capabilities). For a "thinking" model,
 set `QVTS_THINK=0` to disable reasoning for fast tool-driving — **except** where the model is only accurate
-with it on (test both). `gemma4:e4b` here is a locally-imported custom model; substitute any tool-capable
-Ollama model that fits your VRAM.
+with it on (test both). The default `gemma4:e4b` is a public Ollama model — `ollama pull gemma4:e4b`
+(`setup-macos.sh` does this for you); substitute any tool-capable Ollama model that fits your VRAM.
+</details>
+
+<details>
+<summary><b>Getting the default model (gemma4:e4b)</b></summary>
+
+`gemma4:e4b` is a normal, publicly pullable Ollama model — `setup-macos.sh` runs this automatically, or do it by hand:
+
+```bash
+ollama pull gemma4:e4b                                  # ~9.6 GB, multimodal, tool-capable
+ollama create gemma4-vts -f Modelfile.gemma4            # the tuned variant (temp 0.15, num_gpu 999)
+ollama show gemma4:e4b | grep -iA1 Capabilities         # confirm it lists `tools`
+```
+
+If your machine has < 16 GB unified memory, `setup-macos.sh` falls back to `qwen2.5-coder:7b` automatically
+(gemma4:e4b loads ~10 GB and needs ~16 GB to stay 100% on GPU). Override the base with
+`QVTS_BASE_MODEL=<tag> bash setup-macos.sh`.
 </details>
 
 ## Output optimization
@@ -206,7 +222,11 @@ the cost you *avoided*. Token counts are `≈ chars/4` estimates.
 
 ## Token-saving features
 
-Beyond keeping the raw search loop out of Claude's context, the bridge stacks four token-savers:
+The unique axis here is **delegating work to a free local model** — both *searching* and *reading* — so
+the lane is complementary to deterministic compaction (caveman), the code index (vs-token-safer), and log
+tooling (gamedev-log), not competing with them.
+
+**Searching delegation** (find / count / list):
 
 - **Terse, repo-relative output** — the model's answer is forced to a bare `file:line` list and the
   project-root prefix is stripped (~80 % fewer return tokens; see [Output optimization](#output-optimization)).
@@ -214,22 +234,39 @@ Beyond keeping the raw search loop out of Claude's context, the bridge stacks fo
   actually received, to `~/.vts-local/savings.json`. Read it with **`qvts --savings`**; each `--json`
   response also carries a per-call `savings` object.
 - **Locate cache** — a repeated identical locate returns from `~/.vts-local/cache/` with **zero model
-  cost** (~16× faster in practice). Invalidation: a git repo keys on `HEAD` (clean) and **isn't cached
-  while dirty**; a non-git target uses a TTL. Bypass with **`--no-cache`**.
-- **Batch delegation** — **`qvts --batch '["q1","q2",…]'`** runs many locates over one warm MCP
-  connection + warm model and returns a single `{results:[…]}` map (cache + ledger apply per query). The
-  payload can be inline JSON, a file path, or `-` for stdin.
+  cost** (~16× faster). Invalidation: a git repo keys on `HEAD` (clean) and **isn't cached while dirty**;
+  a non-git target uses a TTL. Bypass with **`--no-cache`**.
+- **Batch delegation** — **`qvts --batch '["q1","q2",…]'`** runs many locates over one warm connection +
+  warm model (bounded `QVTS_CONCURRENCY`) and returns one `{results:[…]}` map. Payload: inline JSON, a file, or `-`.
+
+**Reading delegation** (digest / triage — the local model reads so Claude doesn't):
+
+- **`qvts digest <file|-> [--focus "..."]`** — distill a big artifact (diff, PR body, test/build output,
+  JSON/API dump, long prose) into the shortest faithful brief; chunks + map-reduces past one window.
+  Measured ~80–94 % fewer tokens than Claude reading the raw file.
+- **`qvts triage-diff [<file>|--staged|-]`** — the local model triages a git diff into JSON
+  `{summary, hotspots, open}` so Claude opens only the flagged files (94 % smaller than the raw diff in testing).
+- **Auto-distill hook** (opt-in) — `hooks/steer-distill.js` nudges a large-file `Read` toward `qvts digest`.
+  `VTS_AUTO_DISTILL=1` (warn) / `=block`; off by default.
+
+**Performance:** model kept resident (`keep_alive`), and an optional **warm daemon**
+(**`qvts daemon start|stop|status`**) holds one hot vs-search index so repeat calls skip the per-call
+server spawn; the CLI auto-routes one-shots to it (`--no-daemon` to opt out).
 
 ```bash
 qvts -p ./app --json "where is createSession declared"     # one locate (cached, ledgered)
 qvts -p ./app --batch '["find AuthService","callers of login","files named *.test.ts"]'   # many, one session
+qvts digest ./pr_body.md --focus "risks + which files to review"   # distill a big artifact
+qvts -p ./app triage-diff --json                           # triage the working-tree diff
+qvts -p ./app daemon start                                 # keep the index warm across calls
 qvts --savings                                             # cumulative tokens saved
 ```
 
 ## Configuration
 
 `config-loader.mjs` merges, low→high: **built-in defaults < `qvts.config.json` < `VTS_*`/`QVTS_*` env.**
-CLI flags: `--json` · `-p/--project <repo>` · `--savings` · `--no-cache` · `--batch <json|file|->`.
+Commands: `qvts "<locate>"` · `qvts digest <file>` · `qvts triage-diff` · `qvts daemon start|stop|status` · `qvts --savings`.
+Flags: `--json` · `-p/--project <repo>` · `--no-cache` · `--no-daemon` · `--batch <json|file|->` · `--focus "..."` · `--staged`.
 
 | Config key | Env var | Default | Meaning |
 | --- | --- | --- | --- |
@@ -244,6 +281,11 @@ CLI flags: `--json` · `-p/--project <repo>` · `--savings` · `--no-cache` · `
 | — | `QVTS_CACHE_DIR` / `QVTS_CACHE_MAX` | `~/.vts-local/cache` / `500` | Cache location / max entries (oldest pruned). |
 | — | `QVTS_SAVINGS_FILE` | `~/.vts-local/savings.json` | Savings ledger path. |
 | — | `VTS_USD_PER_MTOK` | `3` | $/Mtok rate for the `--savings` value line. |
+| — | `QVTS_KEEP_ALIVE` | `30m` | How long Ollama keeps the model resident between calls. |
+| — | `QVTS_CONCURRENCY` | `2` | Parallel queries in `--batch` (one GPU serializes generation). |
+| — | `QVTS_DIGEST_CHUNK` | `40000` | Chars per chunk before `digest` map-reduces. |
+| — | `QVTS_DAEMON_PORT` | `7879` | Warm-daemon port (127.0.0.1 only). |
+| — | `VTS_AUTO_DISTILL` | off | Large-`Read` steer hook: `1`/`warn` (nudge) · `block` · off. `QVTS_DISTILL_MIN` (51200) = byte threshold. |
 | `ollamaHost` | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama address. |
 | `port` | `PORT` | `7878` | Dashboard port. |
 
