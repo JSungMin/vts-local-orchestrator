@@ -10,6 +10,7 @@
  */
 import http from "node:http";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createAgent } from "./agent-core.mjs";
@@ -100,6 +101,11 @@ const HTML = String.raw`<!doctype html>
     <div class="pill" style="margin-top:4px">tok ≈ chars/4 추정 · C는 vts savings.json 툴별 raw:out 비율 기반</div>
     <h3>tools (locator)</h3>
     <div id="tools" class="pill"></div>
+    <h3>all-time saved (ledger)</h3>
+    <div class="stat"><span>delegations</span><b id="ld">0</b></div>
+    <div class="stat"><span>saved vs vts</span><b id="lv" style="color:var(--ok)">0</b></div>
+    <div class="stat"><span>saved vs grep</span><b id="lg" style="color:var(--ok)">0</b></div>
+    <pre class="ps" id="lt">–</pre>
     <h3>ollama ps (GPU)</h3>
     <pre class="ps" id="ps">–</pre>
   </aside>
@@ -142,6 +148,15 @@ document.getElementById('f').addEventListener('submit',async e=>{e.preventDefaul
   try{await fetch('/run',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({task:q})});}
   catch(err){alert(err.message);} finally{document.getElementById('go').disabled=false;}
 });
+// All-time persistent ledger (qvts CLI/daemon savings), refreshed periodically.
+async function loadLedger(){try{const j=await (await fetch('/savings')).json();
+  set('ld',fmt(j.delegations));
+  set('lv',fmt(Math.max(0,(j.ccVtsTok||0)-(j.delegateTok||0))));
+  set('lg',fmt(Math.max(0,(j.ccGrepTok||0)-(j.delegateTok||0))));
+  const tools=Object.entries(j.byTool||{}).sort((a,b)=>(b[1].rawTok||0)-(a[1].rawTok||0));
+  document.getElementById('lt').textContent=tools.length?tools.map(([t,v])=>t+': '+v.calls+' call(s)').join('\n'):'(no data yet)';
+}catch{}}
+loadLedger(); setInterval(loadLedger,5000);
 </script></body></html>`;
 
 const server = http.createServer(async (req, res) => {
@@ -174,6 +189,14 @@ const server = http.createServer(async (req, res) => {
       finally { busy = false; }
     });
     return;
+  }
+  if (url === "/savings") {
+    // cumulative token-savings ledger (~/.vts-local/savings.json) — local read only.
+    const p = process.env.QVTS_SAVINGS_FILE || path.join(os.homedir(), ".vts-local", "savings.json");
+    let led = { delegations: 0, delegateTok: 0, ccVtsTok: 0, ccGrepTok: 0, byTool: {} };
+    try { led = JSON.parse(fs.readFileSync(p, "utf8")); } catch { /* none yet */ }
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    return res.end(JSON.stringify(led));
   }
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("not found");
