@@ -31,6 +31,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { execSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
+import { definitionSearches, detectLang } from "./defn-patterns.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -353,6 +354,35 @@ function sanitizeScopeArgs(name, args) {
   return args;
 }
 
+// def_search — a synthetic, DETERMINISTIC declaration locator layered over search_text. Given a symbol name
+// (+ optional lang), it tries the language's definition regexes in priority order (ctags-style kinds; def
+// before forward-decl) and returns the first that matches. This removes the small model's biggest locate
+// failure: searching the BARE name (floods with usages/#includes/comments → the time-box buries the decl).
+// One well-shaped navigation primitive beats many bare text scans (RepoNavigator/OrcaLoca localization).
+const DEF_EMPTY = /\bno (text |symbol )?match|\bnot found\b|\(0\)/i;
+async function defSearch(client, args) {
+  const sym = String(args.name || args.symbol || args.q || "").trim();
+  if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
+  const lang = (args.lang && String(args.lang).toLowerCase()) || detectLang(PROJECT) || "";
+  const cands = definitionSearches(sym, lang || undefined).slice(0, 6);
+  const tried = [];
+  for (const c of cands) {
+    let out;
+    try {
+      const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: PROJECT } });
+      out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
+      if (r.isError) out = `TOOL ERROR:\n${out}`;
+    } catch (e) {
+      out = `TOOL EXCEPTION: ${e.message}`;
+    }
+    tried.push(c.q);
+    const hit = !DEF_EMPTY.test(out) && !/^TOOL E/.test(out);
+    process.stderr.write(`  · def_search[${lang || "auto"}] /${c.q}/ → ${hit ? "HIT" : "(0)"}\n`);
+    if (hit) return `def_search(${sym}, lang=${lang || "auto"}) — definition pattern /${c.q}/ [${c.kind}]:\n${out}`;
+  }
+  return `no match — def_search(${sym}) tried ${tried.length} definition pattern(s) for lang=${lang || "auto"} and none matched. The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
+}
+
 // Extract balanced {...} / [...] JSON blobs embedded in free text (one level of nesting tracking).
 function extractJsonBlobs(text) {
   const out = [];
@@ -628,6 +658,10 @@ there is no toolchain). They return COMPACT file:line results, never whole files
 ask to read entire files.
 
 Pick the right tool:
+- WHERE IS X DECLARED / DEFINED -> def_search name="X" (FIRST choice when available). It builds the correct
+  definition regex for the language and skips usages/#includes/comments — far more reliable than a bare
+  search_text. Use it before search_symbol/search_text for any declaration hunt. Pass lang="cpp|csharp|ts|
+  js|python|go|java|rust" only to override the auto-detected language. Report the file:line it returns.
 - Find a symbol/class/function/type/variable -> search_symbol. Never guess paths.
 - Find a file by name -> find_files.
 - Who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
@@ -716,7 +750,39 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history) {
       const schema = toolSchemas.find((t) => t.name === name);
       trace.push({ tool: name, args });
       let resultText;
-      if (!schema) {
+      if (name === "def_search") {
+        // Synthetic deterministic declaration locator (not a vs-search tool) — handled here.
+        const sig = "def_search " + JSON.stringify(args);
+        if (executed.has(sig)) {
+          dupCount++;
+          resultText =
+            `ALREADY CALLED def_search with these args; the result was unchanged:\n${executed.get(sig).slice(0, 300)}\n` +
+            `Do NOT repeat it — give your FINAL answer, or try a different name/lang.`;
+          if (dupCount >= 3) {
+            messages.push({ role: "tool", content: resultText, tool_name: name });
+            return { answer: "(stopped: the local model looped on def_search.)", trace, acct };
+          }
+        } else {
+          dupCount = 0;
+          resultText = await defSearch(client, args);
+          executed.set(sig, resultText);
+          const ot = estTok(resultText);
+          const r = RATIOS.search_text || RATIOS._global || 1;
+          acct.outTok += ot;
+          acct.rawTok += ot * r;
+          const b = (acct.byTool.def_search ||= { calls: 0, outTok: 0, rawTok: 0 });
+          b.calls += 1; b.outTok += ot; b.rawTok += ot * r;
+          if (isEmpty(resultText)) {
+            unproductive++;
+            if (unproductive >= 4) {
+              messages.push({ role: "tool", content: resultText.slice(0, 8000), tool_name: name });
+              return { answer: "(stopped: no results after 4 tries — likely misspelled or absent.)", trace, acct };
+            }
+          } else {
+            unproductive = 0;
+          }
+        }
+      } else if (!schema) {
         resultText = `ERROR: unknown tool "${name}". Available: ${toolSchemas.map((t) => t.name).join(", ")}`;
       } else {
         injectProject(schema, args);
@@ -1192,6 +1258,32 @@ async function main() {
   const allTools = (await client.listTools()).tools;
   const tools = allTools.filter((t) => allowed.has(t.name));
   const ollamaTools = tools.map(toOllamaTool);
+  // Expose def_search — a synthetic deterministic declaration locator layered over search_text (handled in
+  // runAgent, never sent to vs-search). Added to BOTH the model tool list and the schema set so the
+  // text-fallback parser accepts it. Disable with QVTS_DEF_SEARCH=0.
+  if (!/^(0|false|off|no)$/i.test(process.env.QVTS_DEF_SEARCH || "")) {
+    tools.push({ name: "def_search", inputSchema: { type: "object", properties: { name: { type: "string" }, lang: { type: "string" } }, required: ["name"] } });
+    ollamaTools.push({
+      type: "function",
+      function: {
+        name: "def_search",
+        description:
+          "Locate a DECLARATION/definition by name using language-aware definition regexes " +
+          "(class/struct/interface/enum/type/function/def). PREFER this over search_text for any " +
+          "'where is X declared/defined' — it builds the correct definition pattern for the language and " +
+          "skips usages, #includes and comments. args: name (required); lang (optional: " +
+          "cpp|csharp|ts|js|python|go|java|kotlin|rust — auto-detected from the project if omitted).",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Symbol/type/function name to locate the declaration of" },
+            lang: { type: "string", description: "Optional language hint; auto-detected if omitted" },
+          },
+          required: ["name"],
+        },
+      },
+    });
+  }
   process.stderr.write(`vs-search locator tools: ${tools.map((t) => t.name).join(", ")}\n\n`);
 
   // Daemon serve mode: hold this warm MCP+model session and answer locates over 127.0.0.1 until killed.

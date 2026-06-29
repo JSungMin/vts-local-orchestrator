@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
+import { definitionSearches, detectLang } from "./defn-patterns.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -33,6 +34,8 @@ there is no toolchain). They return COMPACT file:line results, never whole files
 ask to read entire files.
 
 Pick the right tool:
+- WHERE IS X DECLARED / DEFINED -> def_search name="X" (FIRST choice). Builds the right definition regex per
+  language, skips usages/#includes/comments. Use before search_symbol/search_text for any declaration hunt.
 - Find a symbol/class/function/type/variable -> search_symbol. Never guess paths.
 - Find a file by name -> find_files.
 - who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
@@ -205,6 +208,30 @@ const isEmptyResult = (r) => {
   );
 };
 
+// def_search — synthetic deterministic declaration locator over search_text (see vts-bridge.mjs). Tries the
+// language's definition regexes in priority order and returns the first that matches.
+const DEF_EMPTY = /\bno (text |symbol )?match|\bnot found\b|\(0\)/i;
+async function defSearch(client, args, project) {
+  const sym = String(args.name || args.symbol || args.q || "").trim();
+  if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
+  const lang = (args.lang && String(args.lang).toLowerCase()) || detectLang(project) || "";
+  const cands = definitionSearches(sym, lang || undefined).slice(0, 6);
+  for (const c of cands) {
+    let out;
+    try {
+      const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: project } });
+      out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
+      if (r.isError) out = `TOOL ERROR:\n${out}`;
+    } catch (e) {
+      out = `TOOL EXCEPTION: ${e.message}`;
+    }
+    if (!DEF_EMPTY.test(out) && !/^TOOL E/.test(out)) {
+      return `def_search(${sym}, lang=${lang || "auto"}) — definition pattern /${c.q}/ [${c.kind}]:\n${out}`;
+    }
+  }
+  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"}; none matched.`;
+}
+
 // Streamed /api/chat. Calls onDelta(text) per token chunk; resolves with the assembled message + timing.
 async function ollamaChatStream(messages, tools, onDelta) {
   const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
@@ -303,6 +330,21 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const allTools = (await client.listTools()).tools;
   const tools = allTools.filter((t) => allowed.has(t.name));
   const ollamaTools = tools.map(toOllamaTool);
+  // Synthetic deterministic declaration locator (handled in run(), never sent to vs-search). Disable: QVTS_DEF_SEARCH=0.
+  if (!/^(0|false|off|no)$/i.test(process.env.QVTS_DEF_SEARCH || "")) {
+    tools.push({ name: "def_search", inputSchema: { type: "object", properties: { name: { type: "string" }, lang: { type: "string" } }, required: ["name"] } });
+    ollamaTools.push({
+      type: "function",
+      function: {
+        name: "def_search",
+        description:
+          "Locate a DECLARATION/definition by name using language-aware definition regexes. PREFER over " +
+          "search_text for 'where is X declared/defined' — skips usages/#includes/comments. args: name " +
+          "(required); lang (optional cpp|csharp|ts|js|python|go|java|kotlin|rust — auto-detected if omitted).",
+        parameters: { type: "object", properties: { name: { type: "string" }, lang: { type: "string" } }, required: ["name"] },
+      },
+    });
+  }
   const validNames = new Set(tools.map((t) => t.name));
   const ratios = loadRawRatios();
 
@@ -355,7 +397,39 @@ export async function createAgent({ onEvent = () => {} } = {}) {
         const schema = tools.find((t) => t.name === name);
         trace.push({ tool: name, args });
         let resultText, ok = true;
-        if (!schema) {
+        if (name === "def_search") {
+          const sig = "def_search " + JSON.stringify(args);
+          if (executed.has(sig)) {
+            dupCount++;
+            onEvent({ type: "tool_call", tool: name, args, dup: true });
+            resultText = "ALREADY CALLED def_search with these args; give your FINAL answer or try a different name/lang.";
+            ok = false;
+            if (dupCount >= 3) {
+              const ans = "(stopped: looped on def_search.)";
+              const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
+              onEvent({ type: "stopped", reason: "looped on def_search", trace, stats });
+              return { answer: ans, trace, stats };
+            }
+          } else {
+            dupCount = 0;
+            onEvent({ type: "tool_call", tool: name, args, dup: false });
+            resultText = await defSearch(client, args, project);
+            executed.set(sig, resultText);
+            const ot = estTok(resultText);
+            outTokSum += ot;
+            rawTokSum += ot * (ratios.search_text || ratios._global || 1);
+            if (isEmptyResult(resultText)) {
+              unproductive++;
+              if (unproductive >= 4) {
+                onEvent({ type: "tool_result", tool: name, ok: false, text: resultText });
+                const ans = "(stopped: no results after 4 tries.)";
+                const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
+                onEvent({ type: "stopped", reason: "no results after 4 tries", trace, stats });
+                return { answer: ans, trace, stats };
+              }
+            } else unproductive = 0;
+          }
+        } else if (!schema) {
           resultText = `ERROR: unknown tool "${name}".`;
           ok = false;
         } else {
