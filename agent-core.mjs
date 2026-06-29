@@ -39,6 +39,10 @@ Pick the right tool:
 - raw strings/comments/config the index can't answer -> search_text.
 - search_text / find_files: NEVER pass a directory (or the project root) as \`path\` — it scopes to a single
   FILE, so a directory matches nothing. OMIT \`path\` to search the WHOLE tree; use \`glob\` ("*.h") to limit.
+- DECLARATION hunt via search_text: ALWAYS search the DEFINITION pattern, not the bare name — \`class .*Name\` /
+  \`struct .*Name\` for a type, \`Name\\s*\\(\` for a function (bare name floods with usages/#includes/comments
+  and the time-box buries the declaration → false "no match"). Holds even for loose requests ("the game-instance
+  class" → \`class .*GameInstance\`, glob "*.h").
 - UNINDEXED / NOT-YET-INDEXED C/C++: search_symbol / document_symbols may be ABSENT, or present but return
   empty / "timed out" / error fast (index not ready). EITHER way, don't retry them — fall back:
   1) find_files for the likely file (class FooBar usually in FooBar.h; strip a UE prefix U/A/F/S/E for the name).

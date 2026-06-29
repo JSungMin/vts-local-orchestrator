@@ -635,6 +635,11 @@ Pick the right tool:
 - search_text / find_files: do NOT pass a directory (and NEVER the project root) as \`path\`/\`dir\` — \`path\`
   scopes to a single FILE, so a directory matches NOTHING. OMIT \`path\` to search the WHOLE tree (the default);
   set it only to restrict to one known file. Use \`glob\` (e.g. "*.h") to limit by extension instead.
+- DECLARATION hunt via search_text (no symbol index): ALWAYS search the DEFINITION pattern, never the bare
+  name — \`class .*Name\` / \`struct .*Name\` / \`enum .*Name\` for a type, \`Name\\s*\\(\` for a function. The
+  bare name floods with usages, #includes and comments, so on a big tree the time-box buries the one
+  declaration line and you wrongly conclude "no match". This holds even when the request names the type only
+  loosely (e.g. "the game-instance class" → search \`class .*GameInstance\`, glob "*.h").
 - UNINDEXED / NOT-YET-INDEXED C/C++: search_symbol / document_symbols may be ABSENT from your tool list, OR
   present but return empty / "timed out" / an error fast (the clangd index isn't ready). In EITHER case do
   NOT retry them — fall back immediately to the index-free chain:
