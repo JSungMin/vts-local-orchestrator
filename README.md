@@ -251,8 +251,11 @@ tooling (gamedev-log), not competing with them.
   Measured ~80–94 % fewer tokens than Claude reading the raw file.
 - **`qvts triage-diff [<file>|--staged|-]`** — the local model triages a git diff into JSON
   `{summary, hotspots, open}` so Claude opens only the flagged files (94 % smaller than the raw diff in testing).
-- **Auto-distill hook** (opt-in) — `hooks/steer-distill.js` nudges a large-file `Read` toward `qvts digest`.
-  `VTS_AUTO_DISTILL=1` (warn) / `=block`; off by default.
+- **Auto-distill hook** (opt-in, **not auto-registered**) — `hooks/steer-distill.js` nudges a large-file
+  `Read` toward `qvts digest`. Wire it into your own `settings.json` (see the file header) and set
+  `VTS_AUTO_DISTILL=1` (warn — recommended). `=block` is **risky** (Claude must Read before it can Edit, and
+  a digest is lossy — blocking a large non-code Read can break the read-before-edit flow). The plugin does
+  **not** hook your `Read`s by default.
 
 **Performance:** model kept resident (`keep_alive`), and an optional **warm daemon**
 (**`qvts daemon start|stop|status`**) holds one hot vs-search index so repeat calls skip the per-call

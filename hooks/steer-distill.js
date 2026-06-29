@@ -3,11 +3,16 @@
  * steer-distill.js — a PreToolUse hook that steers a LARGE-file Read toward `qvts digest`, so the local
  * model distills the artifact and Claude ingests a compact brief instead of the whole file.
  *
- * Honest steer (like vs-token-safer's grep-block): a hook can't replace a tool RESULT, so it nudges the
- * model to re-issue the read as a digest. OPT-IN and OFF by default — this only fires when you ask for it:
- *   VTS_AUTO_DISTILL unset / "0"   → silent no-op (default)
- *   VTS_AUTO_DISTILL "1" / "warn"  → inject a non-blocking suggestion (model sees it, Read still runs)
- *   VTS_AUTO_DISTILL "block"       → block the Read (exit 2); model must use `qvts digest`
+ * NOT auto-registered by the plugin — wiring a hook to EVERY Read has real costs, so this is a manual
+ * OPT-IN. To enable, add it to your ~/.claude/settings.json yourself, e.g.:
+ *   "hooks": { "PreToolUse": [ { "matcher": "Read",
+ *     "hooks": [ { "type": "command", "command": "node <abs>/hooks/steer-distill.js" } ] } ] }
+ * and set VTS_AUTO_DISTILL. Then this nudges a large-file Read toward `qvts digest`:
+ *   VTS_AUTO_DISTILL unset / "0"   → silent no-op
+ *   VTS_AUTO_DISTILL "1" / "warn"  → inject a non-blocking suggestion (RECOMMENDED — the Read still runs)
+ *   VTS_AUTO_DISTILL "block"       → block the Read (exit 2). ⚠ RISKY: Claude must Read a file before it
+ *                                    can Edit it, and a digest is lossy — blocking a large non-code Read
+ *                                    can break the read-before-edit flow. Prefer "warn".
  *
  * Scope: the Read tool on a file larger than QVTS_DISTILL_MIN bytes (default 51200 = 50 KB). Code files are
  * left to vs-token-safer's read_symbol steer; this targets big artifacts a digest fits (diffs, logs, JSON,
