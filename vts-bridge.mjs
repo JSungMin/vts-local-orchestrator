@@ -29,7 +29,7 @@ import readline from "node:readline";
 import crypto from "node:crypto";
 import http from "node:http";
 import { execSync, spawn } from "node:child_process";
-import { loadConfig } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -604,6 +604,9 @@ Pick the right tool:
 - Find a file by name -> find_files.
 - Who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - Raw strings/comments/config keys the symbol index can't answer -> search_text.
+- If search_symbol is NOT in your tool list (or returns nothing) for a C/C++ declaration, find it WITHOUT the
+  index: call find_files for the likely file (a class FooBar is usually in FooBar.h — strip a leading type
+  prefix like U/A/F/S/E for the filename), then document_symbols on that file to read the declaration's file:line.
 
 Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
 - When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
@@ -1042,6 +1045,16 @@ async function main() {
       ...process.env,
       VTS_PREWARM: process.env.VTS_PREWARM ?? "0",
       VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0",
+      // READER-ONLY by default: never let the local-model's clangd background-index. The shared in-tree/db
+      // index (~/.vs-token-safer/db) is built/maintained by ONE indexer (Claude's vs-token-safer plugin, or
+      // a one-time scoped warmup); this spawn only READS those shards. Prevents two clangd fighting to index
+      // the same huge UE tree (double CPU/RAM) and makes symbol queries fail-fast (empty) instead of hanging
+      // when no index exists yet. Override with VTS_CLANGD_BG_INDEX=1 (full) / safe to let it index too.
+      VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0",
+      // SAFETY NET: bound how long a clangd query waits for its index. A huge UNSCOPED index can be built yet
+      // still slow to load/query — without a bound, search_symbol hangs minutes. 15s → if clangd can't answer,
+      // it returns empty and the model falls back to the index-free locators. Override via VTS_LSP_INDEX_WAIT_MS.
+      VTS_LSP_INDEX_WAIT_MS: process.env.VTS_LSP_INDEX_WAIT_MS ?? "15000",
     },
     stderr: "inherit",
   });
@@ -1060,9 +1073,30 @@ async function main() {
   // QVTS_TOOLS may only NARROW the read-only set — never silently grant edit/admin tools (a local model
   // must not mutate code). A non-read-only name is dropped with a warning unless QVTS_ALLOW_MUTATION=1.
   const ALLOW_MUTATION = /^(1|true|on|yes)$/i.test(process.env.QVTS_ALLOW_MUTATION || "");
-  const requested = process.env.QVTS_TOOLS
-    ? process.env.QVTS_TOOLS.split(",").map((s) => s.trim()).filter(Boolean)
-    : [...DEFAULT_TOOLS];
+  // Toolset precedence: QVTS_TOOLS env > qvts.config.json `tools` > full read-only DEFAULT. On an
+  // UN-INDEXED big tree (e.g. UE C++ with no compile_commands.json), set config `tools` to the index-free
+  // locators (search_text, find_files, document_symbols, read_symbol) so the model never calls a clangd
+  // tool (search_symbol/find_references/goto/hover/diagnostics) and never triggers the index wait/hang.
+  // clangd symbol/ref/def/hover/diagnostics need a C/C++ compile DB or prebuilt index; without one they hang
+  // on a big tree. AUTO-NARROW (general, zero-config): drop them when the project is C/C++ with no usable
+  // index. JS/TS/Python (tsserver/pyright) and indexed C/C++ keep the full set. An explicit QVTS_TOOLS /
+  // config `tools` always wins (no auto-narrow). Disable the auto step with QVTS_AUTO_NARROW=0.
+  const INDEX_TOOLS = new Set(["search_symbol", "find_references", "goto_definition", "hover", "diagnostics"]);
+  const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
+  let requested;
+  if (toolsSpec) {
+    requested = toolsSpec.split(",").map((s) => s.trim()).filter(Boolean);
+  } else {
+    requested = [...DEFAULT_TOOLS];
+    const autoNarrow = !/^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
+    if (autoNarrow && !clangdIndexUsable(PROJECT)) {
+      requested = requested.filter((n) => !INDEX_TOOLS.has(n));
+      process.stderr.write(
+        `[vts-local] no clangd index for ${PROJECT} — exposing index-free locators only ` +
+          `(generate compile_commands.json or set QVTS_TOOLS to enable symbol search).\n`,
+      );
+    }
+  }
   const allowed = new Set(
     requested.filter((n) => {
       if (DEFAULT_TOOLS.has(n) || ALLOW_MUTATION) return true;
@@ -1217,8 +1251,11 @@ async function main() {
     } else {
       process.stdout.write("\n" + out + "\n");
     }
-    await client.close();
-    return;
+    // Hard-exit after a one-shot: client.close() asks the vs-search server to dispose clangd, but a busy
+    // clangd child can keep the event loop alive for minutes (observed rc=124 on big trees). Give close a
+    // brief grace, then force exit so the CLI always returns promptly.
+    await Promise.race([client.close().catch(() => {}), new Promise((r) => setTimeout(r, 1500))]);
+    process.exit(0);
   }
 
   // REPL
