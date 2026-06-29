@@ -226,6 +226,28 @@ function pruneCache() {
   }
 }
 
+// Content-addressed cache for digest/triage (keyed by model + the artifact's content hash, not git HEAD —
+// a digest only changes when the bytes do). Repeated digests of the same file then cost ZERO model time.
+const sha1 = (s) => crypto.createHash("sha1").update(String(s)).digest("hex");
+function contentCacheGet(kind, contentHash, extra) {
+  const key = sha1([kind, MODEL, extra || "", contentHash].join("\0"));
+  try {
+    return JSON.parse(fs.readFileSync(cachePath(key), "utf8"));
+  } catch {
+    return null;
+  }
+}
+function contentCachePut(kind, contentHash, extra, value) {
+  const key = sha1([kind, MODEL, extra || "", contentHash].join("\0"));
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(cachePath(key), JSON.stringify(value));
+    pruneCache();
+  } catch {
+    /* best-effort */
+  }
+}
+
 // ---- warm daemon -----------------------------------------------------------------------------------
 // Spawning the vs-search server (and re-warming the tsserver/clangd index) per `qvts` call is the main
 // per-call latency. The daemon keeps ONE MCP+model session warm and serves locates over 127.0.0.1, so
@@ -423,7 +445,11 @@ async function ollamaPlain(system, user) {
 }
 
 function readSource(src) {
-  if (!src || src === "-") return fs.readFileSync(0, "utf8"); // stdin
+  if (!src || src === "-") {
+    if (process.stdin.isTTY) throw new Error("no input — pass a file path, or pipe text (or use '-' with a pipe)");
+    return fs.readFileSync(0, "utf8"); // stdin
+  }
+  if (!fs.existsSync(src)) throw new Error(`file not found: ${src}`);
   return fs.readFileSync(src, "utf8");
 }
 
@@ -668,14 +694,31 @@ async function main() {
     const fi = rawArgs.indexOf("--focus");
     const focus = fi !== -1 ? rawArgs[fi + 1] || "" : "";
     const srcArg = rawArgs.slice(1).find((a) => a !== "--json" && a !== "--focus" && a !== focus);
-    const text = readSource(srcArg);
-    const brief = await digestText(text, focus);
+    let text;
+    try {
+      text = readSource(srcArg);
+    } catch (e) {
+      process.stderr.write(`digest: ${e.message}\n`);
+      process.exit(2);
+    }
+    const noCache = process.argv.includes("--no-cache");
+    const ch = sha1(text);
+    let brief, cached = false;
+    const hit = noCache ? null : contentCacheGet("digest", ch, focus);
+    if (hit) {
+      brief = hit.brief;
+      cached = true;
+      process.stderr.write("  · [cache hit] (no model run)\n");
+    } else {
+      brief = await digestText(text, focus);
+      if (!noCache) contentCachePut("digest", ch, focus, { brief });
+    }
     const origTok = estTok(text);
     const savings = recordSavings(
       { outTok: origTok, rawTok: origTok, byTool: { digest: { calls: 1, outTok: origTok, rawTok: origTok } } },
       brief,
     );
-    if (wantJson) process.stdout.write(JSON.stringify({ mode: "digest", source: srcArg || "(stdin)", brief, savings }) + "\n");
+    if (wantJson) process.stdout.write(JSON.stringify({ mode: "digest", source: srcArg || "(stdin)", brief, savings, cached }) + "\n");
     else process.stdout.write("\n" + brief + "\n");
     return;
   }
@@ -696,7 +739,13 @@ async function main() {
       process.stdout.write((wantJson ? JSON.stringify({ mode: "triage-diff", summary: "no changes", hotspots: [], open: [] }) : "no changes") + "\n");
       return;
     }
-    const t = await triageDiff(diff);
+    const noCache = process.argv.includes("--no-cache");
+    let t = noCache ? null : contentCacheGet("triage", sha1(diff), "");
+    if (t) process.stderr.write("  · [cache hit] (no model run)\n");
+    else {
+      t = await triageDiff(diff);
+      if (!noCache) contentCachePut("triage", sha1(diff), "", t);
+    }
     const origTok = estTok(diff);
     const savings = recordSavings(
       { outTok: origTok, rawTok: origTok, byTool: { triage: { calls: 1, outTok: origTok, rawTok: origTok } } },
@@ -846,6 +895,15 @@ async function main() {
       res.writeHead(404);
       res.end();
     });
+    server.on("error", (e) => {
+      process.stderr.write(`vts-local daemon: cannot listen on 127.0.0.1:${DAEMON_PORT} — ${e.message}\n`);
+      try {
+        client.close();
+      } catch {
+        /* ignore */
+      }
+      process.exit(1);
+    });
     server.listen(DAEMON_PORT, "127.0.0.1", () => {
       try {
         fs.mkdirSync(path.dirname(DAEMON_FILE), { recursive: true });
@@ -909,7 +967,12 @@ async function main() {
     await Promise.all(
       Array.from({ length: Math.min(conc, queries.length) }, async () => {
         for (let i = next++; i < queries.length; i = next++) {
-          results[i] = await locate(client, tools, ollamaTools, String(queries[i]), noCache);
+          // Isolate per-query failures so one bad query can't reject the whole batch.
+          try {
+            results[i] = await locate(client, tools, ollamaTools, String(queries[i]), noCache);
+          } catch (e) {
+            results[i] = { q: String(queries[i]), answer: `(error: ${e.message})`, trace: [], cached: false, error: true };
+          }
         }
       }),
     );
