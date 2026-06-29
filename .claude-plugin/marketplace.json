@@ -10,7 +10,7 @@
     {
       "name": "vts-local-orchestrator",
       "source": "./",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "category": "development",
       "description": "Any local LLM (Ollama) drives vs-token-safer's vs-search tools; Claude delegates cheap code-location to it. Model-agnostic (default gemma4:e4b). CLI + web dashboard (token-savings panel) + delegation-routing skill."
     }
