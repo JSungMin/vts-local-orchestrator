@@ -32,7 +32,7 @@ import http from "node:http";
 import { execSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 import { definitionSearches, detectLang } from "./defn-patterns.mjs";
-import { logActivity } from "./activity-log.mjs";
+import { logActivity, logLive } from "./activity-log.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -704,9 +704,11 @@ FINAL ANSWER FORMAT (strict — your answer goes to another program, not a human
   config-loader.mjs:40
   agent-core.mjs:14,16`;
 
-async function runAgent(client, toolSchemas, ollamaTools, task, history) {
+async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgress) {
   const messages = history;
   messages.push({ role: "user", content: task });
+  const prog = (ev) => { try { onProgress?.(ev); } catch { /* never let telemetry break a locate */ } };
+  prog({ kind: "start", task });
   const trace = []; // { tool, args } per call — surfaced in --json so the Claude orchestrator can audit
   const acct = { outTok: 0, rawTok: 0, byTool: {} }; // savings accounting (fed to the ledger by the caller)
   const validNames = new Set(toolSchemas.map((t) => t.name));
@@ -735,6 +737,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history) {
     let calls = msg.tool_calls || [];
     if (!calls.length) calls = parseToolCallsFromText(msg.content, validNames);
     if (!calls.length) {
+      prog({ kind: "final", answer: msg.content || "(no answer)" });
       return { answer: msg.content || "(no answer)", trace, acct };
     }
 
@@ -765,7 +768,9 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history) {
           }
         } else {
           dupCount = 0;
+          prog({ kind: "tool", tool: "def_search", args });
           resultText = await defSearch(client, args);
+          prog({ kind: "result", tool: "def_search", preview: resultText.slice(0, 160) });
           executed.set(sig, resultText);
           const ot = estTok(resultText);
           const r = RATIOS.search_text || RATIOS._global || 1;
@@ -813,6 +818,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history) {
         } else {
           dupCount = 0;
           process.stderr.write(`  · ${name}(${JSON.stringify(args)})\n`);
+          prog({ kind: "tool", tool: name, args });
           try {
             const out = await client.callTool({ name, arguments: args });
             resultText = (out.content || [])
@@ -822,6 +828,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history) {
           } catch (e) {
             resultText = `TOOL EXCEPTION: ${e.message}`;
           }
+          prog({ kind: "result", tool: name, preview: resultText.slice(0, 160) });
           executed.set(sig, resultText);
           // Savings accounting: what Claude would have eaten for THIS tool result (capped vs raw-grep est.).
           {
@@ -885,7 +892,9 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     process.stderr.write(`  · [cache hit] ${query}\n`);
   } else {
     const history = [{ role: "system", content: SYSTEM }];
-    const r = await runAgent(client, tools, ollamaTools, query, history);
+    const runId = crypto.randomUUID();
+    const onProgress = (ev) => logLive({ runId, project: PROJECT, query, ...ev });
+    const r = await runAgent(client, tools, ollamaTools, query, history, onProgress);
     out = relAnswer(r.answer);
     trace = r.trace;
     acct = r.acct;
@@ -913,6 +922,13 @@ async function main() {
   const sub = rawArgs[0];
   // NOTE: the qvts.sh wrapper consumes --json into QVTS_JSON env, so check both.
   const wantJson = process.argv.includes("--json") || /^(1|true|on|yes)$/i.test(process.env.QVTS_JSON || "");
+  // Token frugality: by DEFAULT the JSON sent to Claude is just {answer, saved} — the only thing Claude needs.
+  // The full {task, trace, savings, cached} (the per-tool call log) is debug detail that's ALSO on stderr, so
+  // echoing it on stdout would spend the very tokens delegation exists to save (a locate's trace can be 10–50×
+  // the answer). Pass --trace to get the full object. slimOne for one-shots, slimBatch keeps `q` to map results.
+  const wantTrace = process.argv.includes("--trace");
+  const slimOne = (full) => (wantTrace ? full : { answer: full.answer, saved: full.savings ? full.savings.savedVsGrep : undefined });
+  const slimBatch = (r) => (wantTrace ? r : { q: r.q, answer: r.answer, saved: r.savings ? r.savings.savedVsGrep : undefined });
 
   // qvts digest <file|-> [--focus "..."]  — distill a big artifact into a compact brief.
   if (sub === "digest") {
@@ -1124,7 +1140,7 @@ async function main() {
             }
           }),
         );
-        process.stdout.write(JSON.stringify({ batch: true, results, viaDaemon: true }) + "\n");
+        process.stdout.write(JSON.stringify({ batch: true, results: results.map(slimBatch), viaDaemon: true }) + "\n");
         return;
       }
     } else if (st) {
@@ -1132,7 +1148,7 @@ async function main() {
       if (oneShotEarly) {
         const r = await httpJson("POST", st.port, "/locate", { query: oneShotEarly, noCache });
         if (r.status === 200 && r.json) {
-          if (wantJson) process.stdout.write(JSON.stringify({ task: oneShotEarly, answer: r.json.answer, trace: r.json.trace, savings: r.json.savings, cached: r.json.cached, viaDaemon: true }) + "\n");
+          if (wantJson) process.stdout.write(JSON.stringify(wantTrace ? { task: oneShotEarly, answer: r.json.answer, trace: r.json.trace, savings: r.json.savings, cached: r.json.cached, viaDaemon: true } : { answer: r.json.answer, saved: r.json.savings ? r.json.savings.savedVsGrep : undefined, viaDaemon: true }) + "\n");
           else process.stdout.write("\n" + r.json.answer + "\n");
           return;
         }
@@ -1423,7 +1439,7 @@ async function main() {
         }
       }),
     );
-    process.stdout.write(JSON.stringify({ batch: true, results }) + "\n");
+    process.stdout.write(JSON.stringify({ batch: true, results: results.map(slimBatch) }) + "\n");
     await client.close();
     return;
   }
@@ -1436,7 +1452,7 @@ async function main() {
   if (oneShot) {
     const { answer: out, trace, savings, cached } = await locate(client, tools, ollamaTools, oneShot, noCache);
     if (JSON_OUT || process.env.QVTS_JSON === "1") {
-      process.stdout.write(JSON.stringify({ task: oneShot, answer: out, trace, savings, cached }) + "\n");
+      process.stdout.write(JSON.stringify(slimOne({ task: oneShot, answer: out, trace, savings, cached })) + "\n");
     } else {
       process.stdout.write("\n" + out + "\n");
     }
