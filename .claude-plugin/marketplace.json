@@ -2,12 +2,15 @@
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "vts-local",
   "description": "Drive vs-token-safer's vs-search tools with any local LLM (Ollama, full-GPU) so Claude delegates cheap, high-volume code-location and reading to a free local model — and gets back only the compact file:line answer. Model-agnostic (default gemma4:e4b). Local-only.",
-  "owner": { "name": "D4ANote", "url": "https://github.com/JSungMin" },
+  "owner": {
+    "name": "D4ANote",
+    "url": "https://github.com/JSungMin"
+  },
   "plugins": [
     {
       "name": "vts-local-orchestrator",
       "source": "./",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "development",
       "description": "Any local LLM (Ollama) drives vs-token-safer's vs-search tools; Claude delegates cheap code-location to it. Model-agnostic (default gemma4:e4b). CLI + web dashboard (token-savings panel) + delegation-routing skill."
     }
