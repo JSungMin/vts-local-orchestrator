@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-label="vts-local-orchestrator: Claude delegates bulk code-work to a free local model; only the compact file:line answer returns to Claude.">
+  <rect x="1" y="1" width="958" height="538" rx="16" fill="#ffffff" stroke="#d0d7de" stroke-width="2"/>
+
+  <text x="480" y="40" text-anchor="middle" font-size="23" font-weight="700" fill="#1f2328">vts-local-orchestrator — how it works</text>
+  <text x="480" y="65" text-anchor="middle" font-size="13.5" fill="#57606a">Claude delegates bulk code-work to a <tspan font-weight="700" fill="#16a34a">FREE local model</tspan> — only the compact <tspan font-weight="700">file:line</tspan> answer returns.</text>
+
+  <!-- (1) direct MCP route: a quick single lookup Claude does itself -->
+  <path d="M 135 135 Q 470 80 720 135" fill="none" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <polygon points="720,135 712,128 711,138" fill="#8c959f"/>
+  <text x="430" y="86" text-anchor="middle" font-size="12" fill="#57606a">① direct <tspan font-weight="700">vs-search</tspan> MCP — a quick single lookup</text>
+
+  <!-- boxes -->
+  <rect x="34" y="150" width="160" height="84" rx="10" fill="#f3e8ff" stroke="#7C3AED" stroke-width="2"/>
+  <text x="114" y="182" text-anchor="middle" font-size="16" font-weight="700" fill="#5b21b6">Claude</text>
+  <text x="114" y="201" text-anchor="middle" font-size="11.5" fill="#6b21a8">plan · reason · edit</text>
+  <text x="114" y="219" text-anchor="middle" font-size="11" font-weight="700" fill="#b91c1c">PAID (tokens)</text>
+
+  <rect x="352" y="140" width="214" height="104" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="459" y="170" text-anchor="middle" font-size="16" font-weight="700" fill="#166534">Local LLM</text>
+  <text x="459" y="190" text-anchor="middle" font-size="12.5" fill="#15803d">gemma4:e4b (benchmarked)</text>
+  <text x="459" y="208" text-anchor="middle" font-size="11.5" fill="#15803d">Ollama · full-GPU · FREE</text>
+  <text x="459" y="227" text-anchor="middle" font-size="11.5" fill="#15803d">drives the tools, in a loop</text>
+
+  <rect x="652" y="150" width="158" height="84" rx="10" fill="#dbeafe" stroke="#1f6feb" stroke-width="2"/>
+  <text x="731" y="180" text-anchor="middle" font-size="15" font-weight="700" fill="#0a3069">vs-search</text>
+  <text x="731" y="198" text-anchor="middle" font-size="10.5" fill="#0a3069">clangd · tsserver</text>
+  <text x="731" y="213" text-anchor="middle" font-size="10.5" fill="#0a3069">pyright · tree-sitter</text>
+
+  <rect x="858" y="160" width="74" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="2"/>
+  <text x="895" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">your</text>
+  <text x="895" y="206" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">code</text>
+
+  <!-- forward arrows -->
+  <line x1="194" y1="178" x2="346" y2="178" stroke="#16a34a" stroke-width="2.4"/>
+  <polygon points="352,178 342,173 342,183" fill="#16a34a"/>
+  <text x="270" y="166" text-anchor="middle" font-size="11.5" font-weight="700" fill="#166534">② qvts -p &lt;repo&gt;</text>
+  <text x="270" y="200" text-anchor="middle" font-size="10.5" fill="#57606a">locate · digest · triage</text>
+
+  <line x1="566" y1="178" x2="646" y2="178" stroke="#1f6feb" stroke-width="2.2"/>
+  <polygon points="652,178 642,173 642,183" fill="#1f6feb"/>
+  <text x="609" y="168" text-anchor="middle" font-size="10.5" fill="#57606a">tool calls</text>
+
+  <line x1="810" y1="190" x2="854" y2="190" stroke="#8c959f" stroke-width="2"/>
+  <polygon points="858,190 849,185 849,195" fill="#8c959f"/>
+
+  <!-- return arrow: compact answer back to Claude -->
+  <line x1="346" y1="225" x2="200" y2="225" stroke="#16a34a" stroke-width="2.8"/>
+  <polygon points="194,225 204,219 204,231" fill="#16a34a"/>
+  <text x="273" y="242" text-anchor="middle" font-size="11.5" font-weight="700" fill="#166534">compact file:line only</text>
+
+  <text x="459" y="270" text-anchor="middle" font-size="11.5" fill="#57606a">raw search output stays in the local model — free, private, never enters Claude's context</text>
+
+  <!-- divider -->
+  <line x1="34" y1="292" x2="926" y2="292" stroke="#eaeef2" stroke-width="2"/>
+
+  <!-- token cost bars -->
+  <text x="34" y="322" font-size="14" font-weight="700" fill="#1f2328">What Claude actually pays — tokens</text>
+  <text x="44" y="352" font-size="11.5" fill="#57606a">Claude greps / reads raw</text>
+  <rect x="250" y="340" width="600" height="20" rx="4" fill="#fca5a5"/>
+  <text x="858" y="355" font-size="11" font-weight="700" fill="#b91c1c">~100%</text>
+
+  <text x="44" y="382" font-size="11.5" fill="#57606a">Claude runs vs-search itself</text>
+  <rect x="250" y="370" width="300" height="20" rx="4" fill="#fcd34d"/>
+  <text x="558" y="385" font-size="11" font-weight="700" fill="#92600a">~30–50%</text>
+
+  <text x="44" y="412" font-size="11.5" font-weight="700" fill="#166534">Delegate to local (this tool)</text>
+  <rect x="250" y="400" width="58" height="20" rx="4" fill="#4ade80"/>
+  <text x="316" y="415" font-size="11" font-weight="700" fill="#166534">~6–20%  ·  digest/triage ~6–20% of a raw read</text>
+
+  <!-- feature lanes -->
+  <text x="34" y="456" font-size="14" font-weight="700" fill="#1f2328">Token-savers (the free local model does the work)</text>
+
+  <rect x="34" y="468" width="290" height="48" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.4"/>
+  <text x="48" y="488" font-size="11.5" font-weight="700" fill="#166534">Search delegation</text>
+  <text x="48" y="506" font-size="10.5" fill="#15803d">locate · cache (0-cost repeats) · batch · ledger</text>
+
+  <rect x="336" y="468" width="290" height="48" rx="8" fill="#eff6ff" stroke="#1f6feb" stroke-width="1.4"/>
+  <text x="350" y="488" font-size="11.5" font-weight="700" fill="#0a3069">Read delegation</text>
+  <text x="350" y="506" font-size="10.5" fill="#0a3069">digest · triage-diff — the model reads, not Claude</text>
+
+  <rect x="638" y="468" width="288" height="48" rx="8" fill="#faf5ff" stroke="#7C3AED" stroke-width="1.4"/>
+  <text x="652" y="488" font-size="11.5" font-weight="700" fill="#5b21b6">Performance</text>
+  <text x="652" y="506" font-size="10.5" fill="#6b21a8">warm daemon · keep_alive · parallel batch</text>
+</svg>
