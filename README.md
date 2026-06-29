@@ -18,6 +18,13 @@
 >
 > Fully local: Ollama + vs-token-safer + the dashboard all run on `127.0.0.1`. **Nothing leaves your machine.**
 
+> **Why the default is `gemma4:e4b` (not a code model).** On a 16 GB Apple M4, it was the *most accurate*
+> locator — clean `file:line` in a single tool call, reproducibly — and the fastest of the accurate models.
+> The obvious pick, the code-specialized **qwen2.5-coder 7B, reproducibly *fails* declaration search**
+> (loops on the wrong tool); 14B is accurate but memory-tight + slow; qwen3 is accurate only in its slow
+> "thinking" mode; gemma3:12b can't tool-call at all. It's a measured choice — full A/B table in
+> [Model choice & benchmark](#model-choice--benchmark). The pipeline is model-agnostic: swap it in one config line.
+
 ```text
         ┌─ Claude (plan · reason · synthesize · edit/review) ──────────────┐
         │   (1) vs-search MCP directly        → a quick single lookup       │
