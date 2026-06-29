@@ -39,6 +39,59 @@ function resolveVtsServer() {
   return ""; // empty -> entry points raise a clear "run setup.ps1 / set VTS_SERVER" error
 }
 
+// GENERAL auto-narrow signal: should the local model be offered clangd symbol/ref tools for this project?
+// They only answer FAST on a C/C++ tree that's small enough to index — on a huge UE tree (Engine included),
+// even a built index is slow to load/query, so clangd queries dead-end (the model just reports "no match"
+// instead of falling back). We mirror vs-token-safer's OWN resource policy: it disables clangd's
+// background-index above ~15k TUs. So: narrow C/C++ when there's no compile DB, or the compile DB has more
+// TUs than the threshold. tsserver/pyright (JS/TS/Python) need no compile DB and are never narrowed.
+// Returns false → caller drops the index-dependent tools. Bounded (reads one JSON; never walks the tree).
+export function clangdIndexUsable(project) {
+  if (!project) return true;
+  let entries = [];
+  try { entries = fs.readdirSync(project, { withFileTypes: true }); } catch { return true; }
+  // Is this a C/C++ (clangd) project at all? UE .uproject, a .sln, or C/C++ sources at root / one level down.
+  let isCpp = entries.some((e) => {
+    const n = e.name.toLowerCase();
+    return n.endsWith(".uproject") || n.endsWith(".sln") || /\.(c|cc|cpp|cxx|h|hpp|hh|hxx)$/.test(n);
+  });
+  if (!isCpp) {
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      try {
+        if (fs.readdirSync(path.join(project, e.name)).some((f) => /\.(cpp|h|hpp|cc|cxx)$/i.test(f))) { isCpp = true; break; }
+      } catch { /* ignore */ }
+    }
+  }
+  if (!isCpp) return true; // not C/C++ → clangd isn't the backend → never narrow
+
+  // C/C++: locate a compile_commands.json (in-tree root/one-level, or the out-of-tree vts db keyed by basename).
+  const findCdb = () => {
+    const cands = [path.join(project, "compile_commands.json")];
+    for (const e of entries) if (e.isDirectory()) cands.push(path.join(project, e.name, "compile_commands.json"));
+    try {
+      const db = process.env.VTS_DB_DIR || path.join(os.homedir(), ".vs-token-safer", "db");
+      const base = path.basename(project).toLowerCase();
+      for (const e of (fs.existsSync(db) ? fs.readdirSync(db) : [])) {
+        if (e.toLowerCase().startsWith(base)) cands.push(path.join(db, e, "compile_commands.json"));
+      }
+    } catch { /* ignore */ }
+    for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch { /* next */ } }
+    return null;
+  };
+  const cdb = findCdb();
+  if (!cdb) return false; // C/C++ with no compile DB → clangd can't index → narrow
+
+  // Count TUs. Above the threshold the tree is too big for fast symbol search (vts itself throttles/disables
+  // clangd's index here) → narrow. Default 15000 mirrors VTS_CLANGD_BG_INDEX_HARD_TUS; override via QVTS_NARROW_TU_MAX.
+  const max = Number(process.env.QVTS_NARROW_TU_MAX || 15000);
+  try {
+    const arr = JSON.parse(fs.readFileSync(cdb, "utf8"));
+    if (Array.isArray(arr)) return arr.length <= max; // small enough → keep clangd tools; too big → narrow
+  } catch { /* unreadable → fall through */ }
+  return false; // C/C++ with an unreadable/huge DB → narrow to be safe
+}
+
 export function loadConfig() {
   const f = fromFile();
   const e = process.env;

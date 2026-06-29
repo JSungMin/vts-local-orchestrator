@@ -11,7 +11,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -36,6 +36,8 @@ Pick the right tool:
 - Find a file by name -> find_files.
 - who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - raw strings/comments/config the index can't answer -> search_text.
+- If search_symbol is NOT in your tool list (or returns nothing) for a C/C++ declaration, find it without the
+  index: find_files for the likely file (a class is usually in <ClassName>.h), then document_symbols on it.
 
 Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
 - When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
@@ -225,16 +227,25 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const project = readProjectPath();
   // QVTS_TOOLS may only NARROW the read-only set (never grant edit/admin tools) unless QVTS_ALLOW_MUTATION=1.
   const allowMutation = /^(1|true|on|yes)$/i.test(process.env.QVTS_ALLOW_MUTATION || "");
-  const requested = process.env.QVTS_TOOLS
-    ? process.env.QVTS_TOOLS.split(",").map((s) => s.trim()).filter(Boolean)
-    : [...DEFAULT_TOOLS];
+  // precedence: QVTS_TOOLS env > qvts.config.json `tools` > full read-only DEFAULT (see vts-bridge.mjs).
+  const INDEX_TOOLS = new Set(["search_symbol", "find_references", "goto_definition", "hover", "diagnostics"]);
+  const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
+  let requested;
+  if (toolsSpec) {
+    requested = toolsSpec.split(",").map((s) => s.trim()).filter(Boolean);
+  } else {
+    requested = [...DEFAULT_TOOLS];
+    // AUTO-NARROW (general): drop clangd-dependent tools on a C/C++ project with no usable index (they hang).
+    const autoNarrow = !/^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
+    if (autoNarrow && !clangdIndexUsable(project)) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
+  }
   const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
   if (!VTS_SERVER) throw new Error("vs-token-safer server path not found. Run setup.ps1, or set VTS_SERVER / vtsServer in qvts.config.json.");
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [VTS_SERVER],
-    env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0" },
+    env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0", VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0", VTS_LSP_INDEX_WAIT_MS: process.env.VTS_LSP_INDEX_WAIT_MS ?? "15000" },
     stderr: "ignore",
   });
   const client = new Client({ name: "vts-local-dashboard", version: "0.1.0" }, { capabilities: {} });
