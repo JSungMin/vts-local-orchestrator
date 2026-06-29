@@ -63,6 +63,40 @@ function maybeTrim() {
   }
 }
 
+// ---- live progress channel ----------------------------------------------------------------------
+// A separate, short-lived channel for IN-FLIGHT progress (tool → result → final) so the dashboard can show
+// what the local model is doing RIGHT NOW — across every entry point (CLI, delegation, daemon), not just
+// tasks typed into the dashboard form. One JSON line per progress event, keyed by runId. Kept small (it's
+// ephemeral; the activity bus is the durable record). Same off-switch as the activity log.
+export const LIVE_FILE = process.env.QVTS_LIVE_FILE || path.join(os.homedir(), ".vts-local", "live.jsonl");
+const LIVE_MAX = Number(process.env.QVTS_LIVE_MAX || 400);
+let _liveWrites = 0;
+export function logLive(ev) {
+  if (DISABLED || !ev || !ev.kind) return;
+  try {
+    fs.mkdirSync(path.dirname(LIVE_FILE), { recursive: true });
+    fs.appendFileSync(LIVE_FILE, JSON.stringify({ ts: Date.now(), ...ev }) + "\n");
+    if (++_liveWrites % 80 === 0) {
+      const lines = fs.readFileSync(LIVE_FILE, "utf8").split("\n").filter(Boolean);
+      if (lines.length > LIVE_MAX) fs.writeFileSync(LIVE_FILE, lines.slice(lines.length - LIVE_MAX).join("\n") + "\n");
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+export function readLive(limit = 200) {
+  try {
+    const lines = fs.readFileSync(LIVE_FILE, "utf8").split("\n").filter(Boolean);
+    const out = [];
+    for (const l of lines.slice(Math.max(0, lines.length - limit))) {
+      try { out.push(JSON.parse(l)); } catch { /* skip */ }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 // Read the most recent `limit` activity records (oldest→newest). Bounded read for the dashboard.
 export function readActivity(limit = 500) {
   try {

@@ -15,7 +15,9 @@ qvts -p "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --json "$ARGUMENTS
 `pwsh -File "${CLAUDE_PLUGIN_ROOT}/qvts.ps1" -Json "$ARGUMENTS"`. The bridge self-installs its one dependency
 on first run; to pre-install or if it errors with a missing module, run `/vts-local-orchestrator:qvts-deps`.)
 
-Then parse the stdout JSON `{task, answer, trace}`:
+Then parse the stdout JSON. By default it's the slim `{answer, saved}` — `answer` is all I need; `saved` is
+the tokens avoided. (Add `--trace` only when debugging — it appends the full per-tool call log, which costs
+the very tokens delegation saves.)
 - Report the `answer`'s file:line findings.
 - If I need a declaration's body, read it directly with `read_symbol` / Read.
 - If `answer` is empty / "no match" / TOOL ERROR, fall back to the `vs-search` MCP tools myself.

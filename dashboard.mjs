@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { createAgent } from "./agent-core.mjs";
 import { loadConfig } from "./config-loader.mjs";
-import { readActivity, ACTIVITY_FILE } from "./activity-log.mjs";
+import { readActivity, ACTIVITY_FILE, readLive, LIVE_FILE } from "./activity-log.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = loadConfig().port;
@@ -49,12 +49,20 @@ setInterval(async () => { const ps = await ollamaPs(); if (ps) broadcast({ type:
 // Watch the shared activity bus so the tree refreshes the instant ANY qvts entry point (CLI/daemon/hook/this
 // dashboard) appends a record. fs.watch can miss events on some platforms, so a slow poll backs it up.
 function pingActivity() { broadcast({ type: "activity-changed" }); }
-try {
-  fs.mkdirSync(path.dirname(ACTIVITY_FILE), { recursive: true });
-  if (!fs.existsSync(ACTIVITY_FILE)) fs.writeFileSync(ACTIVITY_FILE, ""); // so watch has a target
-  fs.watch(ACTIVITY_FILE, { persistent: false }, () => pingActivity());
-} catch { /* watch unavailable — the poll below covers it */ }
-setInterval(pingActivity, 5000);
+function pingLive() { broadcast({ type: "live-changed" }); }
+function watchFile(file, ping) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fs.existsSync(file)) fs.writeFileSync(file, ""); // so watch has a target
+    fs.watch(file, { persistent: false }, () => ping());
+  } catch { /* watch unavailable — the poll backs it up */ }
+}
+watchFile(ACTIVITY_FILE, pingActivity);
+watchFile(LIVE_FILE, pingLive);
+// Poll backup (fs.watch misses some cross-process appends on Windows). Live is polled faster — it's the
+// in-flight progress the user is watching; the activity tree changes less urgently.
+setInterval(pingLive, 1500);
+setInterval(pingActivity, 3000);
 
 const HTML = String.raw`<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><title>local LLM ↔ vts live</title>
@@ -113,6 +121,7 @@ const HTML = String.raw`<!doctype html>
       <button class="tab on" data-t="live">Live run</button>
       <button class="tab" data-t="act">Activity — 모든 qvts <span class="pill" id="actCount"></span></button>
     </div>
+    <div id="live"></div>
     <div id="log"></div>
     <div id="tree" style="display:none"></div>
   </main>
@@ -169,6 +178,7 @@ es.onmessage=e=>{const ev=JSON.parse(e.data);
   else if(ev.type==='stopped'){dot.className='dot on';set('st','stopped');applyStats(ev.stats);el('stop','🟡 stopped: '+ev.reason,'');}
   else if(ev.type==='ps'){document.getElementById('ps').textContent=ev.text;}
   else if(ev.type==='activity-changed'){loadActivity();}
+  else if(ev.type==='live-changed'){loadLive();}
 };
 let cumV=0,cumG=0;
 const fmt=n=>(n||0).toLocaleString();
@@ -201,7 +211,8 @@ tabs.forEach(t=>t.addEventListener('click',()=>{
   const act=t.dataset.t==='act';
   document.getElementById('tree').style.display=act?'block':'none';
   document.getElementById('log').style.display=act?'none':'block';
-  if(act)loadActivity();
+  document.getElementById('live').style.display=act?'none':'block';
+  if(act)loadActivity();else loadLive();
 }));
 const KIND_ICON={locate:'🧭',def_search:'🎯',digest:'📑',['digest-dir']:'📚',triage:'🩺',web:'🌐'};
 const short=p=>{if(!p)return '(no project)';const s=p.replace(/[\\/]+$/,'').split(/[\\/]/);return s.slice(-2).join('/');};
@@ -252,6 +263,33 @@ function renderActivity(items){
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
 async function loadActivity(){try{const j=await (await fetch('/activity?limit=800')).json();renderActivity(j);}catch{}}
 loadActivity();
+
+// ---- Live progress from ALL entry points (CLI / Claude delegation / daemon), via the live channel ----
+const KI={start:'▶',tool:'🔧',result:'✅',final:'🟢'};
+function renderLive(items){
+  const box=document.getElementById('live');
+  if(!items.length){box.innerHTML='';return;}
+  const runs=new Map();
+  for(const e of items){if(!runs.has(e.runId))runs.set(e.runId,[]);runs.get(e.runId).push(e);}
+  const ids=[...runs.keys()].slice(-5).reverse(); // recent runs, newest first
+  let html='<h3 style="margin:2px 0 6px;color:var(--mut);font-size:11px;text-transform:uppercase">진행 중 · 모든 경로 (위임/CLI/daemon)</h3>';
+  for(const id of ids){
+    const evs=runs.get(id);
+    const q=(evs.find(e=>e.query)||{}).query||(evs.find(e=>e.task)||{}).task||'(task)';
+    const proj=(evs.find(e=>e.project)||{}).project||'';
+    const done=evs.some(e=>e.kind==='final');
+    const rows=evs.filter(e=>e.kind!=='start').map(e=>{
+      const ic=KI[e.kind]||'·';
+      const body=e.kind==='final'?esc(e.answer||''):e.kind==='result'?esc(e.preview||''):esc(e.tool||'')+(e.args?' '+esc(JSON.stringify(e.args)):'');
+      return '<div class="run" style="border:0;padding:2px 0"><span class="top">'+ic+' '+body+'</span></div>';
+    }).join('');
+    html+='<details class="grp" open><summary>'+(done?'🟢':'<span class="dot run"></span>')+' <b>'+esc(q.slice(0,90))+'</b>'
+      +(proj?' <span class="pill">'+esc(short(proj))+'</span>':'')+'</summary><div class="runs">'+rows+'</div></details>';
+  }
+  box.innerHTML=html;
+}
+async function loadLive(){try{const j=await (await fetch('/live?limit=200')).json();renderLive(j);}catch{}}
+loadLive();
 </script></body></html>`;
 
 const server = http.createServer(async (req, res) => {
@@ -284,6 +322,13 @@ const server = http.createServer(async (req, res) => {
       finally { busy = false; }
     });
     return;
+  }
+  if (url === "/live") {
+    // In-flight progress (tool → result → final) across all entry points, newest events last. Local read.
+    const q = (req.url || "").split("?")[1] || "";
+    const limit = Math.min(400, Math.max(1, Number(new URLSearchParams(q).get("limit")) || 200));
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    return res.end(JSON.stringify(readLive(limit)));
   }
   if (url === "/activity") {
     // The shared activity bus — every qvts unit of work (locate/def_search/digest/digest-dir/triage/web)
