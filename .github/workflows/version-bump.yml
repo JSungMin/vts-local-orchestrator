@@ -58,5 +58,6 @@ jobs:
             echo "No version change to commit."; exit 0
           fi
           git commit -m "chore(release): v${{ steps.bump.outputs.version }} [skip ci]"
-          git tag "v${{ steps.bump.outputs.version }}"
+          # annotated tag — `--follow-tags` only pushes annotated tags, not lightweight ones
+          git tag -a "v${{ steps.bump.outputs.version }}" -m "v${{ steps.bump.outputs.version }}"
           git push origin HEAD:main --follow-tags
