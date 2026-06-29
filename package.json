@@ -8,7 +8,9 @@
     "qvts": "vts-bridge.mjs"
   },
   "scripts": {
-    "agent": "node vts-bridge.mjs"
+    "agent": "node vts-bridge.mjs",
+    "deps": "node scripts/ensure-deps.mjs",
+    "secret-scan": "node scripts/secret-scan.mjs --tree"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"

@@ -6,8 +6,9 @@
  * so the proven CLI path is never touched. Shared behaviour: locator-only tools, projectPath injection,
  * tool-call-from-text fallback (qwen-coder template has parser=""), dup + unproductive loop guards.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+// @modelcontextprotocol/sdk is imported DYNAMICALLY inside createAgent() (after ensureDeps) — never a
+// top-level static import — so a fresh plugin install with no node_modules self-heals instead of crashing.
+import { ensureDeps } from "./scripts/ensure-deps.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -282,6 +283,10 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
   if (!VTS_SERVER) throw new Error("vs-token-safer server path not found. Run setup.ps1, or set VTS_SERVER / vtsServer in qvts.config.json.");
+  // Self-heal the one runtime dep, then dynamically load the SDK (see the import note at the top).
+  await ensureDeps();
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [VTS_SERVER],

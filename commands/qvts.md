@@ -12,7 +12,8 @@ qvts -p "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --json "$ARGUMENTS
 ```
 
 (Plugin/Windows fallback: `node "${CLAUDE_PLUGIN_ROOT}/vts-bridge.mjs" --json "$ARGUMENTS"`, or
-`pwsh -File "${CLAUDE_PLUGIN_ROOT}/qvts.ps1" -Json "$ARGUMENTS"`.)
+`pwsh -File "${CLAUDE_PLUGIN_ROOT}/qvts.ps1" -Json "$ARGUMENTS"`. The bridge self-installs its one dependency
+on first run; to pre-install or if it errors with a missing module, run `/vts-local-orchestrator:qvts-deps`.)
 
 Then parse the stdout JSON `{task, answer, trace}`:
 - Report the `answer`'s file:line findings.

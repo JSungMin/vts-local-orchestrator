@@ -20,8 +20,9 @@
  *   VTS_PROJECT     default: read from ~/.vs-token-safer/config.json projectPath
  *   QVTS_MAXSTEPS   default 25  (tool-call rounds before giving up)
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+// NOTE: @modelcontextprotocol/sdk is imported DYNAMICALLY inside main() (after ensureDeps), never as a
+// top-level static import — so a fresh plugin install with no node_modules self-heals instead of crashing.
+import { ensureDeps } from "./scripts/ensure-deps.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1100,6 +1101,10 @@ async function main() {
     );
     process.exit(1);
   }
+  // Self-heal the one runtime dep, then dynamically load the SDK (see the import note at the top).
+  await ensureDeps();
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [VTS_SERVER],
