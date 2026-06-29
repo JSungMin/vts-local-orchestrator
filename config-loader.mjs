@@ -52,5 +52,10 @@ export function loadConfig() {
     port: Number(e.PORT || f.port || 7878),
     tools: (e.QVTS_TOOLS || f.tools || "").trim(), // comma list; empty = locator default in agent
   };
+  // Charter is local-only. The chat body carries repo code (digest/triage) + tool results, so a non-loopback
+  // OLLAMA_HOST would send that off-machine — warn loudly (don't silently break "nothing transmitted").
+  if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(cfg.ollamaHost)) {
+    process.stderr.write(`WARN: OLLAMA_HOST is not loopback (${cfg.ollamaHost}) — code/text will be sent OFF-MACHINE.\n`);
+  }
   return cfg;
 }
