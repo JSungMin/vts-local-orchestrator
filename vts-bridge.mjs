@@ -503,6 +503,8 @@ const DIR_SKIP = new Set([
   "coverage", "vendor", "Intermediate", "Binaries", "Saved", "DerivedDataCache", ".vts-index",
 ]);
 const DIR_MAX_FILES = Number(process.env.QVTS_DIR_MAX_FILES || 40);
+// Never digest likely-secret files (their values would land in the brief + the cache, then go to Claude).
+const SECRET_FILE = /\.(pem|key|p12|pfx|keystore|crt)$|^id_rsa|(^|[._-])(secrets?|credentials?|password)s?($|[._-])/i;
 const DIR_FILE_CHARS = Number(process.env.QVTS_DIR_FILE_CHARS || 16000); // per-file input cap for a brief
 function walkFiles(dir) {
   const out = [];
@@ -517,13 +519,13 @@ function walkFiles(dir) {
     }
     for (const e of entries) {
       if (out.length >= DIR_MAX_FILES) break;
-      if (e.name.startsWith(".") && e.name !== ".env") continue;
+      if (e.name.startsWith(".")) continue; // skip ALL dotfiles (.env/.npmrc/.netrc … = secrets/metadata)
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
         if (!DIR_SKIP.has(e.name)) stack.push(p);
         continue;
       }
-      if (!e.isFile()) continue;
+      if (!e.isFile() || SECRET_FILE.test(e.name)) continue;
       let buf;
       try {
         const st = fs.statSync(p);
@@ -963,14 +965,47 @@ async function main() {
     return;
   }
 
-  // Auto-route a one-shot to a warm daemon for this project (skip the per-call server spawn). The daemon
-  // is OPTIONAL: if none is up, control falls through to the normal per-call path below. --no-daemon opts out.
+  // Auto-route LOCATE-class work (one-shot + --batch) to a warm daemon for this project, reusing its hot
+  // index. Only locates are routed — digest/digest-dir/web/triage were handled above and never reach here,
+  // by design: they don't use the vs-search index (no daemon benefit) and routing a file path / URL over the
+  // local port would add an arbitrary-file-read / SSRF surface. The daemon is OPTIONAL: if none is up,
+  // control falls through to the normal per-call path. --no-daemon opts out.
   if (sub !== "daemon" && !process.env.QVTS_DAEMON_SERVE && !process.argv.includes("--no-daemon")) {
-    const oneShotEarly = rawArgs.filter((a) => !["--json", "--no-cache", "--no-daemon", "--savings"].includes(a)).join(" ").trim();
-    if (oneShotEarly) {
-      const st = await daemonFor(PROJECT);
-      if (st) {
-        const r = await httpJson("POST", st.port, "/locate", { query: oneShotEarly, noCache: process.argv.includes("--no-cache") });
+    const st = await daemonFor(PROJECT);
+    const noCache = process.argv.includes("--no-cache");
+    if (st && sub === "--batch") {
+      let queries = null;
+      try {
+        let raw = rawArgs[rawArgs.indexOf("--batch") + 1] || "";
+        if (raw === "-") raw = fs.readFileSync(0, "utf8");
+        else if (raw && fs.existsSync(raw)) raw = fs.readFileSync(raw, "utf8");
+        queries = JSON.parse(raw);
+      } catch {
+        queries = null; // unparseable → fall through to the normal batch handler for a clean error
+      }
+      if (Array.isArray(queries)) {
+        const conc = Math.max(1, Number(process.env.QVTS_CONCURRENCY || 2));
+        const results = new Array(queries.length);
+        let next = 0;
+        await Promise.all(
+          Array.from({ length: Math.min(conc, queries.length) }, async () => {
+            for (let i = next++; i < queries.length; i = next++) {
+              try {
+                const r = await httpJson("POST", st.port, "/locate", { query: String(queries[i]), noCache });
+                results[i] = r.status === 200 && r.json ? r.json : { q: String(queries[i]), answer: "(daemon error)", error: true };
+              } catch (e) {
+                results[i] = { q: String(queries[i]), answer: `(error: ${e.message})`, error: true };
+              }
+            }
+          }),
+        );
+        process.stdout.write(JSON.stringify({ batch: true, results, viaDaemon: true }) + "\n");
+        return;
+      }
+    } else if (st) {
+      const oneShotEarly = rawArgs.filter((a) => !["--json", "--no-cache", "--no-daemon", "--savings"].includes(a)).join(" ").trim();
+      if (oneShotEarly) {
+        const r = await httpJson("POST", st.port, "/locate", { query: oneShotEarly, noCache });
         if (r.status === 200 && r.json) {
           if (wantJson) process.stdout.write(JSON.stringify({ task: oneShotEarly, answer: r.json.answer, trace: r.json.trace, savings: r.json.savings, cached: r.json.cached, viaDaemon: true }) + "\n");
           else process.stdout.write("\n" + r.json.answer + "\n");
