@@ -6,6 +6,7 @@ name: version-bump
 on:
   push:
     branches: [main]
+  workflow_dispatch: {} # allow a manual run from the Actions tab
 
 permissions:
   contents: write
