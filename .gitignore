@@ -5,6 +5,10 @@ node_modules/
 qvts.config.json
 Modelfile.generated
 
+# org-specific secret-scan denylist (company codenames / internal symbols / paths) — NEVER commit
+# (a denylist of secrets committed in plaintext would itself be the leak). See scripts/secret-scan.mjs.
+.secret-patterns
+
 # runtime / test artifacts (may contain local paths + code identifiers)
 *.log
 *.log.out
