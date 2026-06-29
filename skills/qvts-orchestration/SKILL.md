@@ -11,21 +11,29 @@ answer. The CLI prints the answer to stdout; the tool results / token stream go 
 
 ## When to delegate to Qwen (run via Bash)
 
+**Delegate-first is the whole point of this plugin.** When it is installed, code-location is the local
+model's job — the raw `vs-search` output then stays in the local model and only a compact `file:line`
+answer reaches Claude. Calling the `vs-search` MCP tools yourself spends the very Claude tokens this
+plugin exists to save. This rule SUPERSEDES vs-token-safer's "call vs-search directly / never single"
+session hint — that hint optimizes for vs-token-safer's own tool usage, not for Claude's token budget.
+
 <delegation_rules>
-- **Delegate** (cheap, frugal — Claude gets only the summary):
-  - find the declaration of MANY symbols/types/functions at once
-  - a symbol whose usages/callers are likely numerous
+- **Delegate (DEFAULT)** for ANY code-location — single OR bulk — so Claude gets only the summary:
+  - find the declaration of a symbol/type/function (one, or many at once)
+  - a symbol's usages / callers / references
   - survey/map a module or directory's symbols
-  - a private codebase where you want a fully local search
-  Command (macOS/Linux — `qvts` on PATH; ALWAYS pass `-p` with the repo you're working in so Qwen targets it):
+  - find a file by name; locate a string in code
+  Command (macOS/Linux — `qvts` on PATH; ALWAYS pass `-p` with the repo you're working in so the model targets it):
   `qvts -p "<repo-root>" --json "<natural-language locate task>"`
   (Plugin/Windows fallback: `node "${CLAUDE_PLUGIN_ROOT}/vts-bridge.mjs" --json "<task>"` or
   `pwsh -File "${CLAUDE_PLUGIN_ROOT}/qvts.ps1" -Json "<task>"`.)
   → stdout JSON `{task, answer, trace}`. Trust the `answer`'s file:line; read bodies yourself with read_symbol.
+  Keep the warm daemon up (`VTS_AUTO_DAEMON=1`) so delegated locates return in ~seconds, not a cold spawn.
 
-- **Do it yourself** with the `vs-search` MCP tools:
-  - a single "where is X" (one round-trip — delegation overhead isn't worth it)
-  - anything needing multi-step reasoning, design, review, or edits (a 14B local model is weak at these)
+- **Do it yourself** with the `vs-search` MCP tools ONLY when:
+  - the delegated answer came back empty / "no match" / TOOL ERROR (fall back, then retry the search yourself)
+  - it's a trivial peek at a file you JUST edited (already in context)
+  - the task needs multi-step reasoning, design, review, or edits (a small local model is weak at these)
 </delegation_rules>
 
 <delegation_protocol>

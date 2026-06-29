@@ -36,8 +36,12 @@ Pick the right tool:
 - Find a file by name -> find_files.
 - who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - raw strings/comments/config the index can't answer -> search_text.
-- If search_symbol is NOT in your tool list (or returns nothing) for a C/C++ declaration, find it without the
-  index: find_files for the likely file (a class is usually in <ClassName>.h), then document_symbols on it.
+- search_text / find_files: NEVER pass a directory (or the project root) as \`path\` — it scopes to a single
+  FILE, so a directory matches nothing. OMIT \`path\` to search the WHOLE tree; use \`glob\` ("*.h") to limit.
+- UNINDEXED C/C++: if search_symbol / document_symbols are NOT in your list, only find_files + search_text work:
+  1) find_files for the likely file (class FooBar usually in FooBar.h; strip a UE prefix U/A/F/S/E for the name).
+  2) search_text for the bare NAME as a SUBSTRING or regex \`class .*Name\` — NOT "class Name" (UE decls read
+     \`class MODULE_API UName : public Base\`). Omit \`path\` (or glob "*.h"). The file:line returned IS the answer.
 
 Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
 - When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
@@ -105,6 +109,26 @@ function injectProject(toolSchema, args, project) {
       args[k] = project;
       break;
     }
+  }
+  return args;
+}
+
+// search_text / find_files scope `path` to a single FILE; a DIRECTORY (esp. the project root) matches NOTHING,
+// so a small model passing the repo root as `path` yields a false "no match". Drop a directory path so the
+// locate covers the whole tree. A real file path or a glob never stats as a directory and is preserved.
+const PATH_SCOPE_TOOLS = new Set(["search_text", "find_files"]);
+const PATH_ARGS = ["path", "dir", "file"];
+function sanitizeScopeArgs(name, args, project) {
+  if (!PATH_SCOPE_TOOLS.has(name) || !args) return args;
+  for (const k of PATH_ARGS) {
+    const v = args[k];
+    if (typeof v !== "string" || !v) continue;
+    let isDir = false;
+    try {
+      const abs = path.isAbsolute(v) ? v : path.join(project || process.cwd(), v);
+      isDir = fs.statSync(abs).isDirectory();
+    } catch { /* glob/pattern — leave alone */ }
+    if (isDir) delete args[k];
   }
   return args;
 }
@@ -228,7 +252,14 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   // QVTS_TOOLS may only NARROW the read-only set (never grant edit/admin tools) unless QVTS_ALLOW_MUTATION=1.
   const allowMutation = /^(1|true|on|yes)$/i.test(process.env.QVTS_ALLOW_MUTATION || "");
   // precedence: QVTS_TOOLS env > qvts.config.json `tools` > full read-only DEFAULT (see vts-bridge.mjs).
-  const INDEX_TOOLS = new Set(["search_symbol", "find_references", "goto_definition", "hover", "diagnostics"]);
+  // Language-server-backed for C/C++ (clangd) → hang/error on a big UNINDEXED tree. Drop ALL of them when
+  // clangd is unusable, leaving only the index-free walk/grep locators (find_files, search_text). VERIFIED:
+  // document_symbols times out (clangd) / errors (treesitter backend); read_symbol/concept_search need the
+  // index too. Kept for JS/TS/Python and indexed C/C++ (narrow is gated by clangdIndexUsable).
+  const INDEX_TOOLS = new Set([
+    "search_symbol", "find_references", "goto_definition", "hover", "diagnostics",
+    "document_symbols", "read_symbol", "concept_search",
+  ]);
   const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
   let requested;
   if (toolsSpec) {
@@ -311,6 +342,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
           ok = false;
         } else {
           injectProject(schema, args, project);
+          sanitizeScopeArgs(name, args, project);
           const sig = name + " " + JSON.stringify(args);
           if (executed.has(sig)) {
             dupCount++;

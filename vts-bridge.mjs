@@ -325,6 +325,33 @@ function injectProject(toolSchema, args) {
   return args;
 }
 
+// vs-search's content/file LOCATORS scope `path` to a single FILE (or omit it = whole tree). A small model
+// routinely passes a DIRECTORY there — most often the project ROOT — which then matches NOTHING, producing a
+// false "no match" for a symbol that exists (verified on a large UE tree). Drop a `path`/`dir`/`file` arg that
+// resolves to a directory so the locate covers the whole tree (what an unscoped call does). A real file path or
+// a glob (e.g. "Source/**/*.cpp") never stats as a directory, so it is preserved.
+const PATH_SCOPE_TOOLS = new Set(["search_text", "find_files"]);
+const PATH_ARGS = ["path", "dir", "file"];
+function sanitizeScopeArgs(name, args) {
+  if (!PATH_SCOPE_TOOLS.has(name) || !args) return args;
+  for (const k of PATH_ARGS) {
+    const v = args[k];
+    if (typeof v !== "string" || !v) continue;
+    let isDir = false;
+    try {
+      const abs = path.isAbsolute(v) ? v : path.join(PROJECT || process.cwd(), v);
+      isDir = fs.statSync(abs).isDirectory();
+    } catch {
+      /* not a real fs path (likely a glob/pattern) — leave it alone */
+    }
+    if (isDir) {
+      delete args[k];
+      process.stderr.write(`  · (drop directory ${k}="${v}" on ${name} → search whole tree)\n`);
+    }
+  }
+  return args;
+}
+
 // Extract balanced {...} / [...] JSON blobs embedded in free text (one level of nesting tracking).
 function extractJsonBlobs(text) {
   const out = [];
@@ -604,9 +631,18 @@ Pick the right tool:
 - Find a file by name -> find_files.
 - Who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - Raw strings/comments/config keys the symbol index can't answer -> search_text.
-- If search_symbol is NOT in your tool list (or returns nothing) for a C/C++ declaration, find it WITHOUT the
-  index: call find_files for the likely file (a class FooBar is usually in FooBar.h — strip a leading type
-  prefix like U/A/F/S/E for the filename), then document_symbols on that file to read the declaration's file:line.
+- search_text / find_files: do NOT pass a directory (and NEVER the project root) as \`path\`/\`dir\` — \`path\`
+  scopes to a single FILE, so a directory matches NOTHING. OMIT \`path\` to search the WHOLE tree (the default);
+  set it only to restrict to one known file. Use \`glob\` (e.g. "*.h") to limit by extension instead.
+- UNINDEXED C/C++ TREE: if search_symbol / document_symbols are NOT in your tool list, only find_files and
+  search_text work — use THIS chain and nothing else:
+  1) find_files for the likely file (a class FooBar is usually in FooBar.h — for the FILENAME strip a leading
+     UE type prefix U/A/F/S/E, so UMyClass -> "MyClass").
+  2) search_text to pin the declaration line. Search the bare NAME as a SUBSTRING, or the regex
+     \`class .*Name\` — NOT the exact string "class Name". UE declarations read
+     \`class MODULE_API UName : public Base\`, so "class MyClass" finds nothing but "MyClass"
+     (or \`class .*MyClass\`) matches \`class UMyClass\`. Omit \`path\` (or set glob "*.h").
+  The \`file:line\` that search_text returns IS the answer — report it; do NOT look for document_symbols.
 
 Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
 - When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
@@ -677,6 +713,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history) {
         resultText = `ERROR: unknown tool "${name}". Available: ${toolSchemas.map((t) => t.name).join(", ")}`;
       } else {
         injectProject(schema, args);
+        sanitizeScopeArgs(name, args);
         const sig = name + " " + JSON.stringify(args);
         if (executed.has(sig)) {
           // The model is repeating an identical call (a fixation loop — typically a misspelled query that
@@ -1081,7 +1118,16 @@ async function main() {
   // on a big tree. AUTO-NARROW (general, zero-config): drop them when the project is C/C++ with no usable
   // index. JS/TS/Python (tsserver/pyright) and indexed C/C++ keep the full set. An explicit QVTS_TOOLS /
   // config `tools` always wins (no auto-narrow). Disable the auto step with QVTS_AUTO_NARROW=0.
-  const INDEX_TOOLS = new Set(["search_symbol", "find_references", "goto_definition", "hover", "diagnostics"]);
+  // Tools that are LANGUAGE-SERVER-backed for C/C++ (clangd) and therefore HANG/timeout or error on a big
+  // UNINDEXED tree — drop them all when clangd is unusable, leaving only the genuinely index-free walk/grep
+  // locators (find_files, search_text). VERIFIED on a large UE tree: document_symbols routes through clangd
+  // (textDocument/documentSymbol → timeout) and its treesitter backend errors; read_symbol/concept_search
+  // likewise need the index. They stay for JS/TS/Python (tsserver/pyright) and indexed C/C++ (narrow is
+  // gated by clangdIndexUsable, which is C/C++-specific and returns true elsewhere).
+  const INDEX_TOOLS = new Set([
+    "search_symbol", "find_references", "goto_definition", "hover", "diagnostics",
+    "document_symbols", "read_symbol", "concept_search",
+  ]);
   const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
   let requested;
   if (toolsSpec) {
