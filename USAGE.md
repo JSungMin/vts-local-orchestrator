@@ -19,7 +19,7 @@ npm install          # MCP SDK 클라이언트 (node_modules 있으면 생략)
 ```powershell
 ollama ps
 # NAME                       PROCESSOR   CONTEXT
-# qwen-coder-14b-vts:latest  100% GPU    32768     ← 100% GPU 여야 함
+# qwen25-14b-vts:latest  100% GPU    32768     ← 100% GPU 여야 함
 ```
 
 `100% GPU` 아니면 → DEPLOY.md "VRAM 안 맞을 때" 참고.
@@ -98,7 +98,7 @@ qvts> exit
 | 변수 | 기본값 | 용도 |
 |---|---|---|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama 주소 |
-| `QVTS_MODEL` | `qwen-coder-14b-vts` | 사용 모델 |
+| `QVTS_MODEL` | `qwen25-14b-vts` | 사용 모델 |
 | `VTS_PROJECT` | config.json 의 projectPath | 대상 레포 변경 |
 | `VTS_SERVER` | `…/vs-token-safer/server/index.js` | MCP 서버 경로 |
 | `QVTS_MAXSTEPS` | `25` | 도구 호출 라운드 상한 |
@@ -119,7 +119,7 @@ node vts-bridge.mjs "메인 진입점 어디?"
 |---|---|
 | 첫 질의가 수 분 멈춤 | clangd 콜드 인덱싱(거대 UE 트리). 한 번만 느림. 미리 `vts_admin warmup` 또는 vs-token-safer 데몬 상주 시 재사용 |
 | `Ollama 500` / 응답 없음 | `ollama ps` 로 모델 로드 확인. 안 뜨면 `setup.ps1` 재실행 |
-| `100% GPU` 아님(CPU 오프로드) | VRAM 부족. 다른 GPU 프로세스 종료 or `Modelfile.qwen-coder` 의 `num_ctx` 낮춰 재빌드 |
+| `100% GPU` 아님(CPU 오프로드) | VRAM 부족. 다른 GPU 프로세스 종료 or `Modelfile.qwen25-14b` 의 `num_ctx` 낮춰 재빌드 |
 | 도구가 빈 결과 | 심볼 오타 / clangd 인덱스 미완. 콜드 인덱싱 끝났는지 확인 |
 | `projectPath` 가 cwd로 감 | `~/.vs-token-safer/config.json` 의 `projectPath` 확인 or `VTS_PROJECT` 지정 |
 
