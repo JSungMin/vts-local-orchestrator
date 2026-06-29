@@ -25,12 +25,25 @@ reads, and Claude receives just the short answer. The bulky raw output never rea
 
 **Rule of thumb: "find / count / read" → local model. "decide / design / fix" → Claude.**
 
-```bash
-# Claude delegates a search in one line — and gets back only the answer:
-$ qvts -p ./app --json "where is loadConfig defined, and everything that calls it"
-{"answer":"config-loader.mjs:40\nagent-core.mjs:14,16\nvts-bridge.mjs:29,31", ...}
-#  → ~20 tokens. The local model did the searching; Claude never saw the raw results.
+You don't run any commands. You just ask Claude the way you always do — with the plugin installed, Claude
+quietly hands the search to the local model and shows you the answer:
+
+```text
+You      ▸  where is loadConfig defined, and everything that calls it?
+
+Claude   ▸  (hands the search to the local model on your GPU — its raw output never reaches me)
+            config-loader.mjs:40       ← defined here
+            agent-core.mjs:14,16       ← calls it
+            vts-bridge.mjs:29,31       ← calls it
+
+            The local model did the searching. I only spent ~20 tokens reading the answer back.
 ```
+
+Same for reading: *"what does `tsbridge.py` do — any handlers that spit out a lot?"* → Claude has the local
+model read the file and reports back a few lines, instead of pulling the whole file into the conversation.
+
+> Claude decides when to delegate; you never type a command. Prefer driving it yourself? There's a `qvts`
+> CLI underneath — see [Quickstart](#quickstart).
 
 ## Why you'd want this
 
@@ -50,36 +63,40 @@ bash setup-macos.sh          # macOS/Linux — picks a model for your RAM, build
 #  Windows: setup.ps1  (see DEPLOY.md)
 ```
 
-Then:
+Then install it as a Claude Code plugin (or paste [`claude-routing.md`](claude-routing.md) into your
+`CLAUDE.md`). **That's it** — now ask Claude normally and it delegates searches and big reads on its own.
+
+Want to watch it happen live? `node dashboard.mjs` → http://127.0.0.1:7878.
+
+<details>
+<summary>Driving it yourself (the <code>qvts</code> CLI under the hood)</summary>
+
+You normally never touch this — Claude calls it for you — but it's a plain CLI if you want it:
 
 ```bash
 qvts -p /path/to/repo "find all callers of createSession"     # ask in plain language
 qvts digest ./big-file.md --focus "what does this do?"        # have it read a file for you
-node dashboard.mjs                                            # watch it work → http://127.0.0.1:7878
+qvts --savings                                                # how many tokens you've saved
 ```
-
-**Let Claude do it automatically:** install this as a Claude Code plugin (or paste
-[`claude-routing.md`](claude-routing.md) into your `CLAUDE.md`). Claude then hands off searches and big
-reads on its own.
+</details>
 
 ## What it can do
 
-**Find code** (the local model searches, you get `file:line`):
-- `qvts "<question>"` — find symbols, callers, files, text. `def_search` builds the right
-  "where is X declared" pattern for the language automatically.
-- `qvts --batch '["q1","q2",…]'` — many searches in one warm session.
+Just ask Claude in plain language — these all get delegated to the local model:
 
-**Read code** (the local model reads, you get a brief):
-- `qvts digest <file> --focus "..."` — summarize a big file without pulling it into Claude.
-- `qvts digest-dir <dir>` — one brief for a whole folder.
-- `qvts triage-diff` — turn a git diff into "here's what matters, open these files."
+**Finding code** — you get back `file:line`:
+- *"where is `loadConfig` declared?"* · *"who calls `createSession`?"* · *"find every file named `*.test.ts`"*
+- *"where are all of these defined: X, Y, Z?"* — many at once, in one pass.
 
-**See it work:**
-- `node dashboard.mjs` — a live local page showing what the model is doing, grouped by project and task
-  type, plus how many tokens you saved.
+**Reading code** — you get a short brief, not a wall of source:
+- *"what does `tsbridge.py` do?"* · *"summarize the `auth` folder"*
+- *"what changed in my diff, and which files should I review?"*
 
-Everything is cached (repeat questions are instant and free) and logged to a savings ledger
-(`qvts --savings`).
+**Seeing it work:**
+- *"open the dashboard"* — a live local page showing what the model is doing, grouped by project and task
+  type, plus how many tokens you've saved.
+
+Repeat questions are instant and free (cached), and every delegation is added to a running savings tally.
 
 ## Which model
 
