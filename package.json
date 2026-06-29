@@ -1,14 +1,14 @@
 {
-  "name": "qwen-vts-bridge",
+  "name": "vts-local-orchestrator",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local Qwen2.5-Coder (Ollama, full-GPU) agent that drives the vs-token-safer vs-search MCP tools.",
+  "description": "Drive vs-token-safer's vs-search MCP tools with ANY local LLM (Ollama, full-GPU) so Claude delegates cheap code-location and spends its tokens on reasoning. Model-agnostic (default gemma4:e4b).",
   "bin": {
-    "qvts": "qwen-mcp-bridge.mjs"
+    "qvts": "vts-bridge.mjs"
   },
   "scripts": {
-    "agent": "node qwen-mcp-bridge.mjs"
+    "agent": "node vts-bridge.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"

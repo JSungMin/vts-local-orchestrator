@@ -130,5 +130,5 @@ Write-Host "DONE." -ForegroundColor Green
 & $ollama ps
 Write-Host ""
 Write-Host "  Dashboard:  .\dashboard.cmd        (opens http://127.0.0.1:$Port)"
-Write-Host "  CLI:        node qwen-mcp-bridge.mjs `"where is X declared?`""
+Write-Host "  CLI:        node vts-bridge.mjs `"where is X declared?`""
 Write-Host "  Verify GPU: ollama ps  -> PROCESSOR must read 100% GPU"

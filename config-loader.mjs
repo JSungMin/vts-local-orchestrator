@@ -12,8 +12,8 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 function fromFile() {
-  // qvts.config.json next to this module, or under ~/.qwen-vts/ (a global install).
-  for (const p of [path.join(HERE, "qvts.config.json"), path.join(os.homedir(), ".qwen-vts", "config.json")]) {
+  // qvts.config.json next to this module, or under ~/.vts-local/ (a global install).
+  for (const p of [path.join(HERE, "qvts.config.json"), path.join(os.homedir(), ".vts-local", "config.json")]) {
     try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { /* next */ }
   }
   return {};

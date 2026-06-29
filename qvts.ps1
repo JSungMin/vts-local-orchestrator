@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$bridge = Join-Path $here "qwen-mcp-bridge.mjs"
+$bridge = Join-Path $here "vts-bridge.mjs"
 
 if (-not $Task -or $Task.Count -eq 0) { Write-Error "no task given"; exit 2 }
 if ($Project) { $env:VTS_PROJECT = $Project }

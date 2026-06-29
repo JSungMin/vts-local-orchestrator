@@ -2,7 +2,7 @@
  * agent-core.mjs — the Qwen↔vts agentic loop as a reusable, event-emitting module (used by the web
  * dashboard). STREAMS model tokens and emits a structured event per step so a UI can render the loop live.
  *
- * The CLI (qwen-mcp-bridge.mjs) stays self-contained; this module duplicates the small helpers on purpose
+ * The CLI (vts-bridge.mjs) stays self-contained; this module duplicates the small helpers on purpose
  * so the proven CLI path is never touched. Shared behaviour: locator-only tools, projectPath injection,
  * tool-call-from-text fallback (qwen-coder template has parser=""), dup + unproductive loop guards.
  */
@@ -26,17 +26,28 @@ const DEFAULT_TOOLS = new Set([
   "concept_search", "diagnostics",
 ]);
 
-const SYSTEM = `You are a code-navigation agent for a large Unreal Engine C++ codebase.
-You have vs-search tools backed by an official language-server index (clangd). They return COMPACT
-file:line results, never whole files — trust them and do NOT ask to read entire files.
+const SYSTEM = `You are a code-navigation agent for a software repository (any language — C/C++, C#, JS/TS,
+Python, etc.). You have vs-search tools backed by an official language-server index (or tree-sitter when
+there is no toolchain). They return COMPACT file:line results, never whole files — trust them and do NOT
+ask to read entire files.
 
-Rules:
-- Find a symbol/class/function/type/variable with search_symbol. Never guess paths.
+Pick the right tool:
+- Find a symbol/class/function/type/variable -> search_symbol. Never guess paths.
+- Find a file by name -> find_files.
 - who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - raw strings/comments/config the index can't answer -> search_text.
+
+Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
+- When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
+  directly. Do NOT re-search to "double-check" a POSITIVE result, and never overturn a found result into "no match".
 - Copy search terms from the request EXACTLY, character for character — a typo'd query returns nothing.
-- If a search returns no matches twice, STOP and report "no match" — do not keep guessing variants.
-- Chain tools as needed, then give a short, direct answer with file:line citations.`;
+- Never call search_text with a catch-all pattern like ".*". Use a concrete term.
+- If a search genuinely returns no matches twice, STOP and report "no match" — do not keep guessing variants.
+
+FINAL ANSWER FORMAT (strict — your answer goes to another program, not a human):
+- Output ONLY the locations, one per line, as \`path:line\` (group several lines of one file as \`path:line1,line2\`).
+- NO prose, NO sentences, NO "The function is declared at…", NO markdown headers/bullets, NO code fences,
+  NO closing remarks. Just the bare \`path:line\` lines. If nothing was found, output exactly: no match`;
 
 // ~chars/4 token estimate (BPE avg for code). Labelled as an estimate in the UI.
 const estTok = (s) => Math.ceil(String(s || "").length / 4);
@@ -223,7 +234,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
     env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0" },
     stderr: "ignore",
   });
-  const client = new Client({ name: "qwen-vts-dashboard", version: "0.1.0" }, { capabilities: {} });
+  const client = new Client({ name: "vts-local-dashboard", version: "0.1.0" }, { capabilities: {} });
   await client.connect(transport);
 
   const allTools = (await client.listTools()).tools;

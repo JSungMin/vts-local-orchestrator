@@ -17,9 +17,10 @@ answer. The CLI prints the answer to stdout; the tool results / token stream go 
   - a symbol whose usages/callers are likely numerous
   - survey/map a module or directory's symbols
   - a private codebase where you want a fully local search
-  Command:
-  `node "${CLAUDE_PLUGIN_ROOT}/qwen-mcp-bridge.mjs" --json "<natural-language locate task>"`
-  (or `pwsh -File "${CLAUDE_PLUGIN_ROOT}/qvts.ps1" -Json "<task>"`)
+  Command (macOS/Linux — `qvts` on PATH; ALWAYS pass `-p` with the repo you're working in so Qwen targets it):
+  `qvts -p "<repo-root>" --json "<natural-language locate task>"`
+  (Plugin/Windows fallback: `node "${CLAUDE_PLUGIN_ROOT}/vts-bridge.mjs" --json "<task>"` or
+  `pwsh -File "${CLAUDE_PLUGIN_ROOT}/qvts.ps1" -Json "<task>"`.)
   → stdout JSON `{task, answer, trace}`. Trust the `answer`'s file:line; read bodies yourself with read_symbol.
 
 - **Do it yourself** with the `vs-search` MCP tools:
@@ -35,5 +36,5 @@ answer. The CLI prints the answer to stdout; the tool results / token stream go 
    delegate only `search_text` / `find_files` style locates, which need no clangd.
 </delegation_protocol>
 
-Prereq: `setup.ps1` has run (model `qwen-coder-vts` loaded 100% GPU) and `qvts.config.json` points at the
-target repo. See ORCHESTRATION.md / DEPLOY.md in the plugin root.
+Prereq: setup has run (`setup-macos.sh` on macOS/Linux, `setup.ps1` on Windows) — model `qwen-coder-vts`
+loaded (`ollama ps` → 100% GPU) and `qvts.config.json` written. See ORCHESTRATION.md / USAGE.md.

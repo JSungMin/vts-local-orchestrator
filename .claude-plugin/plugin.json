@@ -1,8 +1,8 @@
 {
-  "name": "qwen-vts-orchestrator",
+  "name": "vts-local-orchestrator",
   "version": "0.1.0",
-  "description": "Delegate cheap code-location to a local Qwen2.5-Coder (Ollama, full-GPU) that drives vs-token-safer's vs-search tools — so Claude spends its tokens on reasoning, not raw search output. Ships the qvts CLI, a live web dashboard with a 3-way token-savings panel, and an auto-loading delegation-routing skill.",
+  "description": "Delegate cheap code-location to ANY local LLM (Ollama, full-GPU) that drives vs-token-safer's vs-search tools — so Claude spends its tokens on reasoning, not raw search output. Model-agnostic (default gemma4:e4b). Ships the qvts CLI, a live web dashboard with a 3-way token-savings panel, and an auto-loading delegation-routing skill.",
   "author": { "name": "D4ANote" },
-  "keywords": ["ollama", "qwen", "vs-token-safer", "code-search", "orchestration", "local-llm", "token-savings"],
+  "keywords": ["ollama", "local-llm", "gemma", "qwen", "vs-token-safer", "code-search", "orchestration", "token-savings"],
   "license": "MIT"
 }

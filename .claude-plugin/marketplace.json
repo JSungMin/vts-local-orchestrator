@@ -1,11 +1,11 @@
 {
-  "name": "qwen-vts",
+  "name": "vts-local",
   "owner": { "name": "D4ANote" },
   "plugins": [
     {
-      "name": "qwen-vts-orchestrator",
+      "name": "vts-local-orchestrator",
       "source": "./",
-      "description": "Local Qwen (Ollama) drives vs-token-safer's vs-search tools; Claude delegates cheap code-location to it. CLI + web dashboard (token-savings panel) + delegation-routing skill."
+      "description": "Any local LLM (Ollama) drives vs-token-safer's vs-search tools; Claude delegates cheap code-location to it. Model-agnostic (default gemma4:e4b). CLI + web dashboard (token-savings panel) + delegation-routing skill."
     }
   ]
 }

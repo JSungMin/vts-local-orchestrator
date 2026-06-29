@@ -29,9 +29,9 @@ ollama ps
 ## 1. 단발 질의
 
 ```powershell
-node qwen-mcp-bridge.mjs "UGameInstance 선언 위치 file:line?"
-node qwen-mcp-bridge.mjs "TakeDamage 호출하는 곳 전부 찾아줘"
-node qwen-mcp-bridge.mjs "코드에서 'BeginPlay' 문자열 쓰는 곳"
+node vts-bridge.mjs "UGameInstance 선언 위치 file:line?"
+node vts-bridge.mjs "TakeDamage 호출하는 곳 전부 찾아줘"
+node vts-bridge.mjs "코드에서 'BeginPlay' 문자열 쓰는 곳"
 ```
 
 출력: Qwen이 도구를 연쇄 호출한 뒤(`stderr`에 `· 도구명(인자)` 로그), 마지막에 `file:line` 인용
@@ -56,7 +56,7 @@ dashboard.cmd -Port 8080 ← 포트 변경
 ## 2. REPL (연속 대화)
 
 ```powershell
-node qwen-mcp-bridge.mjs
+node vts-bridge.mjs
 qvts> ACharacter 클래스 멤버 함수 목록
 qvts> 그 중 BeginPlay 본문 보여줘
 qvts> exit
@@ -108,7 +108,7 @@ qvts> exit
 
 ```powershell
 $env:VTS_PROJECT = "G:/path/to/other/repo"
-node qwen-mcp-bridge.mjs "메인 진입점 어디?"
+node vts-bridge.mjs "메인 진입점 어디?"
 ```
 
 ---
@@ -128,7 +128,7 @@ node qwen-mcp-bridge.mjs "메인 진입점 어디?"
 ## 7. 동작 구조 (요약)
 
 ```
-당신 ──질의──▶ qwen-mcp-bridge.mjs ──/api/chat+tools──▶ Ollama(Qwen, GPU)
+당신 ──질의──▶ vts-bridge.mjs ──/api/chat+tools──▶ Ollama(Qwen, GPU)
                     │  ▲                                   │ tool_calls
                     │  └────── 도구 결과 ◀──────────────────┘
                     ▼ MCP stdio (callTool)

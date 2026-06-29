@@ -60,7 +60,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 # 예: 래퍼 run.ps1
 $env:VTS_SERVER  = "D:/tools/vs-token-safer/server/index.js"
 $env:VTS_PROJECT = "D:/work/MyGame"
-node qwen-mcp-bridge.mjs @args
+node vts-bridge.mjs @args
 ```
 
 ---
@@ -92,10 +92,10 @@ ollama run qwen-coder-14b-vts "hi"
 ollama ps                       # PROCESSOR = 100% GPU
 
 # (2) 브리지 ↔ MCP 핸드셰이크 + 도구 목록
-node qwen-mcp-bridge.mjs "test"  # stderr에 'vs-search tools: ...' 15개 떠야 함
+node vts-bridge.mjs "test"  # stderr에 'vs-search tools: ...' 15개 떠야 함
 
 # (3) 실제 코드 질의 (clangd 콜드 인덱싱 한 번 기다림)
-node qwen-mcp-bridge.mjs "아무 클래스나 선언 위치 찾아줘"
+node vts-bridge.mjs "아무 클래스나 선언 위치 찾아줘"
 ```
 
 3단계가 `file:line` 반환하면 정상.
@@ -110,7 +110,7 @@ node qwen-mcp-bridge.mjs "아무 클래스나 선언 위치 찾아줘"
 같이 보낼 파일:
 
 ```
-qwen-mcp-bridge.mjs      # 브리지 본체
+vts-bridge.mjs      # 브리지 본체
 Modelfile.qwen-coder     # 모델 정의
 setup.ps1                # 프로비저닝
 package.json             # SDK 의존성
