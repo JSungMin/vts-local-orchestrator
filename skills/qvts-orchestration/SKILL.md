@@ -36,5 +36,5 @@ answer. The CLI prints the answer to stdout; the tool results / token stream go 
    delegate only `search_text` / `find_files` style locates, which need no clangd.
 </delegation_protocol>
 
-Prereq: setup has run (`setup-macos.sh` on macOS/Linux, `setup.ps1` on Windows) — model `qwen-coder-vts`
-loaded (`ollama ps` → 100% GPU) and `qvts.config.json` written. See ORCHESTRATION.md / USAGE.md.
+Prereq: setup has run (`setup-macos.sh` on macOS/Linux, `setup.ps1` on Windows) — the configured model
+(`gemma4-vts` by default) loaded (`ollama ps` → 100% GPU) and `qvts.config.json` written. See ORCHESTRATION.md / USAGE.md.
