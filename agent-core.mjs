@@ -1,5 +1,5 @@
 /*
- * agent-core.mjs — the Qwen↔vts agentic loop as a reusable, event-emitting module (used by the web
+ * agent-core.mjs — the local-LLM↔vts agentic loop as a reusable, event-emitting module (used by the web
  * dashboard). STREAMS model tokens and emits a structured event per step so a UI can render the loop live.
  *
  * The CLI (vts-bridge.mjs) stays self-contained; this module duplicates the small helpers on purpose
@@ -362,7 +362,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
     //   grep/LSP response (what CC-using-grep/raw would eat, via vts's measured per-tool ratio).
     let outTokSum = 0, rawTokSum = 0;
     const savings = (answer) => {
-      const a = estTok(answer); // delegate: Claude only sees Qwen's summary
+      const a = estTok(answer); // delegate: Claude only sees the local model's summary
       return {
         delegateTok: a,
         ccVtsTok: outTokSum,

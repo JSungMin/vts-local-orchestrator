@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * dashboard.mjs — local web UI to WATCH the Qwen↔vts agent work in real time.
+ * dashboard.mjs — local web UI to WATCH the local-LLM↔vts agent work in real time.
  *   node dashboard.mjs            # then open http://127.0.0.1:7878
  *   PORT=8080 node dashboard.mjs
  *
@@ -46,7 +46,7 @@ const ollamaPs = () =>
 setInterval(async () => { const ps = await ollamaPs(); if (ps) broadcast({ type: "ps", text: ps }); }, 4000);
 
 const HTML = String.raw`<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>Qwen ↔ vts live</title>
+<html lang="ko"><head><meta charset="utf-8"><title>local LLM ↔ vts live</title>
 <style>
   :root{--bg:#0d1117;--panel:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--tool:#bc8cff}
   *{box-sizing:border-box} body{margin:0;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--fg)}
@@ -73,7 +73,7 @@ const HTML = String.raw`<!doctype html>
   .cur{color:var(--fg)}
 </style></head><body>
 <header>
-  <span><span class="dot" id="dot"></span><b>Qwen ↔ vts</b> live</span>
+  <span><span class="dot" id="dot"></span><b id="hmodel">local LLM</b> <span style="color:var(--mut)">↔ vts</span> live</span>
   <span class="pill" id="proj">connecting…</span>
   <span class="pill" id="model"></span>
 </header>
@@ -90,7 +90,7 @@ const HTML = String.raw`<!doctype html>
     <div class="stat"><span>tok/s</span><b id="tps">–</b></div>
     <div class="stat"><span>elapsed</span><b id="ms">–</b></div>
     <h3>토큰 절약 (이번 실행)</h3>
-    <div class="stat"><span title="Claude가 실제로 받는 양 = Qwen 요약">A 위임 (이 방식)</span><b id="sa">–</b></div>
+    <div class="stat"><span title="Claude가 실제로 받는 양 = 로컬 모델 요약">A 위임 (이 방식)</span><b id="sa">–</b></div>
     <div class="stat"><span title="CC가 vs-search 직접 = capped 결과 전부">B CC+VTS</span><b id="sb">–</b></div>
     <div class="stat"><span title="CC가 grep/raw = uncapped 응답 (vts 실측비율 추정)">C CC+Grep</span><b id="sc">–</b></div>
     <div class="stat"><span>↓ vs VTS</span><b id="sv" style="color:var(--ok)">–</b></div>
@@ -121,6 +121,7 @@ function set(id,v){document.getElementById(id).textContent=v;}
 const es=new EventSource('/events');
 es.onmessage=e=>{const ev=JSON.parse(e.data);
   if(ev.type==='ready'){document.getElementById('proj').textContent=ev.project||'(no project)';
+    if(ev.model)document.getElementById('hmodel').textContent=ev.model;
     document.getElementById('model').textContent=ev.model;document.getElementById('tools').textContent=(ev.tools||[]).join(', ');dot.className='dot on';}
   else if(ev.type==='task'){log.innerHTML='';tcCount=0;set('tc','0');set('tps','–');set('ms','–');set('st','running');dot.className='dot run';el('user','🧑 task',ev.task);curThink=null;}
   else if(ev.type==='step'){set('step',ev.step);}
@@ -203,6 +204,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.error(`\n  Qwen↔vts dashboard:  http://${HOST}:${PORT}\n`);
+  console.error(`\n  local-LLM↔vts dashboard:  http://${HOST}:${PORT}\n`);
 });
 for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { try { agent?.close(); } catch { /* */ } process.exit(0); });

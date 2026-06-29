@@ -1,8 +1,8 @@
 ---
-description: Launch the Qwen↔vts live web dashboard (token stream, tool calls, 3-way token-savings panel).
+description: Launch the local-LLM↔vts live web dashboard (token stream, tool calls, 3-way token-savings panel). Works with ANY configured local model (gemma4, qwen, …).
 ---
 
-Launch the Qwen↔vts dashboard so the user can watch the local model drive vs-search in real time:
+Launch the local-LLM↔vts dashboard so the user can watch the configured local model (shown live in the header) drive vs-search in real time:
 
 ```bash
 pwsh -File "${CLAUDE_PLUGIN_ROOT}/dashboard.ps1"
