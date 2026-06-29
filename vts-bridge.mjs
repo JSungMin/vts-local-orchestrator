@@ -27,7 +27,8 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import crypto from "node:crypto";
-import { execSync } from "node:child_process";
+import http from "node:http";
+import { execSync, spawn } from "node:child_process";
 import { loadConfig } from "./config-loader.mjs";
 
 const CFG = loadConfig();
@@ -36,6 +37,7 @@ const MODEL = CFG.model;
 const VTS_SERVER = CFG.vtsServer;
 const MAX_STEPS = CFG.maxSteps;
 const NUM_CTX = CFG.numCtx;
+const KEEP_ALIVE = process.env.QVTS_KEEP_ALIVE || "30m"; // keep the model resident between calls (perf)
 
 // ---- resolve the target project root (so we can inject it into tool args Qwen forgets) ----
 function readProjectPath() {
@@ -224,6 +226,55 @@ function pruneCache() {
   }
 }
 
+// ---- warm daemon -----------------------------------------------------------------------------------
+// Spawning the vs-search server (and re-warming the tsserver/clangd index) per `qvts` call is the main
+// per-call latency. The daemon keeps ONE MCP+model session warm and serves locates over 127.0.0.1, so
+// repeat calls skip the cold spawn. It serves the project it was started with; calls for another project
+// fall back to a per-call spawn. Local-only; nothing transmitted.
+const DAEMON_FILE = process.env.QVTS_DAEMON_FILE || path.join(os.homedir(), ".vts-local", "daemon.json");
+const DAEMON_PORT = Number(process.env.QVTS_DAEMON_PORT || 7879);
+const daemonRead = () => {
+  try {
+    return JSON.parse(fs.readFileSync(DAEMON_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+};
+function httpJson(method, port, urlPath, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = http.request(
+      { host: "127.0.0.1", port, path: urlPath, method, timeout: 600000, headers: data ? { "content-type": "application/json", "content-length": Buffer.byteLength(data) } : {} },
+      (res) => {
+        let s = "";
+        res.on("data", (d) => (s += d));
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, json: s ? JSON.parse(s) : null });
+          } catch {
+            resolve({ status: res.statusCode, json: null });
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+// A daemon that is up AND serving this exact project (else a one-shot must spawn its own server).
+async function daemonFor(project) {
+  const st = daemonRead();
+  if (!st || !st.port) return null;
+  try {
+    const r = await httpJson("GET", st.port, "/health", null);
+    if (r.status === 200 && r.json && r.json.project === (project || null)) return st;
+  } catch {
+    /* not alive */
+  }
+  return null;
+}
+
 // ---- MCP tool schema -> Ollama (OpenAI-style) tool ----
 function toOllamaTool(t) {
   return {
@@ -336,6 +387,7 @@ async function ollamaChat(messages, tools) {
       messages,
       tools,
       stream: false,
+      keep_alive: KEEP_ALIVE,
       ...(THINK !== undefined ? { think: THINK } : {}),
       options: { num_ctx: NUM_CTX, temperature: 0.15 },
     }),
@@ -345,6 +397,71 @@ async function ollamaChat(messages, tools) {
     throw new Error(`Ollama ${res.status}: ${body.slice(0, 500)}`);
   }
   return (await res.json()).message;
+}
+
+// ---- local-model READING/DIGESTING (the "delegate reading, not just searching" axis) -----------------
+// A plain (no-tools) chat turn — used by `digest` and `triage-diff`. Reasoning is OFF by default
+// (summarization doesn't need it; faster), but an explicit QVTS_THINK still wins.
+async function ollamaPlain(system, user) {
+  const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      stream: false,
+      keep_alive: KEEP_ALIVE,
+      think: THINK !== undefined ? THINK : false,
+      options: { num_ctx: NUM_CTX, temperature: 0.15 },
+    }),
+  });
+  if (!res.ok) throw new Error(`Ollama ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
+  return (await res.json()).message?.content || "";
+}
+
+function readSource(src) {
+  if (!src || src === "-") return fs.readFileSync(0, "utf8"); // stdin
+  return fs.readFileSync(src, "utf8");
+}
+
+// `digest`: distill a big artifact into the shortest faithful brief. Map-reduce when it exceeds one window.
+const DIGEST_CHUNK = Number(process.env.QVTS_DIGEST_CHUNK || 40000); // ~10k tok/chunk
+async function digestText(text, focus) {
+  const sys =
+    "You are a context distiller. Produce the SHORTEST faithful brief that lets an engineer act WITHOUT " +
+    "reading the original. Lead with a one-line gist, then terse bullets (facts, decisions, errors, " +
+    "file:line refs, numbers, names). Preserve concrete identifiers/paths/values EXACTLY. No preamble, " +
+    "no 'here is', no closing remarks." + (focus ? ` FOCUS on: ${focus}.` : "");
+  const chunks = [];
+  for (let i = 0; i < text.length; i += DIGEST_CHUNK) chunks.push(text.slice(i, i + DIGEST_CHUNK));
+  if (chunks.length <= 1) return (await ollamaPlain(sys, text || "(empty)")).trim();
+  const parts = [];
+  for (let i = 0; i < chunks.length; i++) {
+    process.stderr.write(`  · digest chunk ${i + 1}/${chunks.length}\n`);
+    parts.push((await ollamaPlain(sys + ` (Part ${i + 1}/${chunks.length}.)`, chunks[i])).trim());
+  }
+  return (await ollamaPlain(sys + " Merge these partial briefs into ONE deduplicated brief.", parts.join("\n\n---\n\n"))).trim();
+}
+
+// `triage-diff`: a git diff → strict JSON {summary, hotspots[], open[]} so Claude opens only flagged files.
+async function triageDiff(diff) {
+  const sys =
+    "You are a code-review triage assistant. Given a git diff, output STRICT JSON ONLY (no prose around it): " +
+    '{"summary":"<=2 sentences","hotspots":[{"file":"path","why":"short risk"}],"open":["paths worth reading"]}. ' +
+    "List only genuinely risky/important files; keep it short.";
+  const raw = await ollamaPlain(sys, diff.length > DIGEST_CHUNK ? diff.slice(0, DIGEST_CHUNK) + "\n…(diff truncated)" : diff);
+  for (const blob of extractJsonBlobs(raw)) {
+    try {
+      const o = JSON.parse(blob);
+      if (o && (o.summary || o.hotspots || o.open)) return o;
+    } catch {
+      /* next */
+    }
+  }
+  return { summary: raw.trim().slice(0, 400), hotspots: [], open: [] };
 }
 
 const SYSTEM = `You are a code-navigation agent for a software repository (any language — C/C++, C#, JS/TS,
@@ -539,6 +656,117 @@ async function main() {
     process.stdout.write(savingsReport() + "\n");
     return;
   }
+
+  // Reading-delegation subcommands — local model only, NO vs-search server needed.
+  const rawArgs = process.argv.slice(2);
+  const sub = rawArgs[0];
+  // NOTE: the qvts.sh wrapper consumes --json into QVTS_JSON env, so check both.
+  const wantJson = process.argv.includes("--json") || /^(1|true|on|yes)$/i.test(process.env.QVTS_JSON || "");
+
+  // qvts digest <file|-> [--focus "..."]  — distill a big artifact into a compact brief.
+  if (sub === "digest") {
+    const fi = rawArgs.indexOf("--focus");
+    const focus = fi !== -1 ? rawArgs[fi + 1] || "" : "";
+    const srcArg = rawArgs.slice(1).find((a) => a !== "--json" && a !== "--focus" && a !== focus);
+    const text = readSource(srcArg);
+    const brief = await digestText(text, focus);
+    const origTok = estTok(text);
+    const savings = recordSavings(
+      { outTok: origTok, rawTok: origTok, byTool: { digest: { calls: 1, outTok: origTok, rawTok: origTok } } },
+      brief,
+    );
+    if (wantJson) process.stdout.write(JSON.stringify({ mode: "digest", source: srcArg || "(stdin)", brief, savings }) + "\n");
+    else process.stdout.write("\n" + brief + "\n");
+    return;
+  }
+
+  // qvts triage-diff [<file>|--staged|-]  — local model triages a git diff to {summary,hotspots,open}.
+  if (sub === "triage-diff" || sub === "triage") {
+    const staged = process.argv.includes("--staged");
+    const fileArg = rawArgs.slice(1).find((a) => a !== "--json" && a !== "--staged");
+    let diff = "";
+    try {
+      if (fileArg) diff = readSource(fileArg);
+      else diff = execSync(`git ${staged ? "diff --staged" : "diff"}`, { cwd: PROJECT || process.cwd(), maxBuffer: 64 * 1024 * 1024 }).toString();
+    } catch (e) {
+      process.stderr.write(`triage-diff: could not read a diff (${e.message}). Pass a file, '-', or run inside a git repo.\n`);
+      process.exit(2);
+    }
+    if (!diff.trim()) {
+      process.stdout.write((wantJson ? JSON.stringify({ mode: "triage-diff", summary: "no changes", hotspots: [], open: [] }) : "no changes") + "\n");
+      return;
+    }
+    const t = await triageDiff(diff);
+    const origTok = estTok(diff);
+    const savings = recordSavings(
+      { outTok: origTok, rawTok: origTok, byTool: { triage: { calls: 1, outTok: origTok, rawTok: origTok } } },
+      JSON.stringify(t),
+    );
+    if (wantJson) process.stdout.write(JSON.stringify({ mode: "triage-diff", ...t, savings }) + "\n");
+    else {
+      process.stdout.write(`\n${t.summary}\n`);
+      if (t.hotspots?.length) process.stdout.write("hotspots:\n" + t.hotspots.map((h) => `  ${h.file} — ${h.why}`).join("\n") + "\n");
+      if (t.open?.length) process.stdout.write("open:\n" + t.open.map((f) => `  ${f}`).join("\n") + "\n");
+    }
+    return;
+  }
+
+  // qvts daemon start|stop|status — warm-session manager (keeps one vs-search index hot across calls).
+  if (sub === "daemon") {
+    const action = rawArgs[1] || "status";
+    if (action === "stop") {
+      const st = daemonRead();
+      if (st?.pid) {
+        try {
+          process.kill(st.pid);
+        } catch {
+          /* already gone */
+        }
+      }
+      try {
+        fs.rmSync(DAEMON_FILE);
+      } catch {
+        /* ignore */
+      }
+      process.stdout.write("daemon stopped\n");
+      return;
+    }
+    if (action === "start") {
+      if (await daemonFor(PROJECT)) {
+        process.stdout.write("daemon already running for this project\n");
+        return;
+      }
+      const child = spawn(process.execPath, [process.argv[1]], {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, QVTS_DAEMON_SERVE: "1", VTS_PROJECT: PROJECT || "" },
+      });
+      child.unref();
+      process.stdout.write(`daemon starting on 127.0.0.1:${DAEMON_PORT} for ${PROJECT || "(cwd)"}\n`);
+      return;
+    }
+    const st = await daemonFor(PROJECT);
+    process.stdout.write(st ? `daemon up: 127.0.0.1:${st.port} · project ${st.project} · pid ${st.pid}\n` : "daemon: not running for this project\n");
+    return;
+  }
+
+  // Auto-route a one-shot to a warm daemon for this project (skip the per-call server spawn). The daemon
+  // is OPTIONAL: if none is up, control falls through to the normal per-call path below. --no-daemon opts out.
+  if (sub !== "daemon" && !process.env.QVTS_DAEMON_SERVE && !process.argv.includes("--no-daemon")) {
+    const oneShotEarly = rawArgs.filter((a) => !["--json", "--no-cache", "--no-daemon", "--savings"].includes(a)).join(" ").trim();
+    if (oneShotEarly) {
+      const st = await daemonFor(PROJECT);
+      if (st) {
+        const r = await httpJson("POST", st.port, "/locate", { query: oneShotEarly, noCache: process.argv.includes("--no-cache") });
+        if (r.status === 200 && r.json) {
+          if (wantJson) process.stdout.write(JSON.stringify({ task: oneShotEarly, answer: r.json.answer, trace: r.json.trace, savings: r.json.savings, cached: r.json.cached, viaDaemon: true }) + "\n");
+          else process.stdout.write("\n" + r.json.answer + "\n");
+          return;
+        }
+      }
+    }
+  }
+
   if (!PROJECT) {
     process.stderr.write(
       "WARN: no project root resolved (set VTS_PROJECT or ~/.vs-token-safer/config.json). " +
@@ -589,6 +817,62 @@ async function main() {
   const ollamaTools = tools.map(toOllamaTool);
   process.stderr.write(`vs-search locator tools: ${tools.map((t) => t.name).join(", ")}\n\n`);
 
+  // Daemon serve mode: hold this warm MCP+model session and answer locates over 127.0.0.1 until killed.
+  if (process.env.QVTS_DAEMON_SERVE) {
+    let chain = Promise.resolve(); // serialize requests over the shared session
+    const server = http.createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, project: PROJECT || null, model: MODEL }));
+      }
+      if (req.method === "POST" && req.url === "/locate") {
+        let b = "";
+        req.on("data", (d) => (b += d));
+        req.on("end", () => {
+          chain = chain.then(async () => {
+            try {
+              const { query, noCache } = JSON.parse(b || "{}");
+              const r = await locate(client, tools, ollamaTools, String(query || ""), !!noCache);
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify(r));
+            } catch (e) {
+              res.writeHead(500, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: e.message }));
+            }
+          });
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    server.listen(DAEMON_PORT, "127.0.0.1", () => {
+      try {
+        fs.mkdirSync(path.dirname(DAEMON_FILE), { recursive: true });
+        fs.writeFileSync(DAEMON_FILE, JSON.stringify({ pid: process.pid, port: DAEMON_PORT, project: PROJECT || null }));
+      } catch {
+        /* ignore */
+      }
+      process.stderr.write(`vts-local daemon on 127.0.0.1:${DAEMON_PORT} (project ${PROJECT})\n`);
+    });
+    const cleanup = () => {
+      try {
+        fs.rmSync(DAEMON_FILE);
+      } catch {
+        /* ignore */
+      }
+      try {
+        client.close();
+      } catch {
+        /* ignore */
+      }
+      process.exit(0);
+    };
+    process.on("SIGTERM", cleanup);
+    process.on("SIGINT", cleanup);
+    return; // stay resident; do not fall through to one-shot/REPL
+  }
+
   const history = [{ role: "system", content: SYSTEM }];
   const JSON_OUT = /^(1|true|on|yes)$/i.test(process.env.QVTS_JSON || "");
   const noCache = process.argv.includes("--no-cache");
@@ -617,8 +901,18 @@ async function main() {
       await client.close();
       process.exit(2);
     }
-    const results = [];
-    for (const q of queries) results.push(await locate(client, tools, ollamaTools, String(q), noCache));
+    // Bounded-concurrency pool: overlap each query's tool round-trips + generation. One GPU serializes
+    // generation, so the default is modest (2); raise QVTS_CONCURRENCY if Ollama has spare parallelism.
+    const conc = Math.max(1, Number(process.env.QVTS_CONCURRENCY || 2));
+    const results = new Array(queries.length);
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(conc, queries.length) }, async () => {
+        for (let i = next++; i < queries.length; i = next++) {
+          results[i] = await locate(client, tools, ollamaTools, String(queries[i]), noCache);
+        }
+      }),
+    );
     process.stdout.write(JSON.stringify({ batch: true, results }) + "\n");
     await client.close();
     return;
