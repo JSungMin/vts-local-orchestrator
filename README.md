@@ -252,7 +252,8 @@ tooling (gamedev-log), not competing with them.
 - **`qvts triage-diff [<file>|--staged|-]`** — the local model triages a git diff into JSON
   `{summary, hotspots, open}` so Claude opens only the flagged files (94 % smaller than the raw diff in testing).
 - **`qvts digest-dir <dir> [--focus "..."]`** — bounded walk of a directory; digests every text file (skips
-  node_modules/build/binaries, caps file count) into one **module brief** (per-file one-liner + an overview),
+  node_modules/build/binaries, **dotfiles + secret files like `.env`/`*.pem`/`credentials.*`**, caps file
+  count) into one **module brief** (per-file one-liner + an overview),
   so Claude understands a module without reading its files. Per-file digests are content-cached + parallel.
 - **`qvts web <url> [--focus "..."]`** — fetch a URL, reduce HTML to text, digest locally → Claude gets a
   brief instead of the whole page. ⚠ This makes an **outbound request to `<url>`** (it pulls public content
@@ -265,7 +266,9 @@ tooling (gamedev-log), not competing with them.
 
 **Performance:** model kept resident (`keep_alive`), and an optional **warm daemon**
 (**`qvts daemon start|stop|status`**) holds one hot vs-search index so repeat calls skip the per-call
-server spawn; the CLI auto-routes one-shots to it (`--no-daemon` to opt out). An opt-in **SessionStart
+server spawn; the CLI auto-routes one-shots **and `--batch` locates** to it (`--no-daemon` to opt out).
+`digest`/`digest-dir`/`web` are intentionally **not** daemon-routed (they don't use the index, and routing a
+file path/URL over the port would add a file-read/SSRF surface). An opt-in **SessionStart
 hook** auto-starts the daemon for the session's repo when **`VTS_AUTO_DAEMON=1`** (off by default). The
 **dashboard** (`node dashboard.mjs`) shows an all-time savings panel from the ledger.
 

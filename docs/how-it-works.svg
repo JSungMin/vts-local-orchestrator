@@ -76,9 +76,9 @@
 
   <rect x="336" y="468" width="290" height="48" rx="8" fill="#eff6ff" stroke="#1f6feb" stroke-width="1.4"/>
   <text x="350" y="488" font-size="11.5" font-weight="700" fill="#0a3069">Read delegation</text>
-  <text x="350" y="506" font-size="10.5" fill="#0a3069">digest · triage-diff — the model reads, not Claude</text>
+  <text x="350" y="506" font-size="10.5" fill="#0a3069">digest · digest-dir · web · triage-diff (model reads)</text>
 
   <rect x="638" y="468" width="288" height="48" rx="8" fill="#faf5ff" stroke="#7C3AED" stroke-width="1.4"/>
   <text x="652" y="488" font-size="11.5" font-weight="700" fill="#5b21b6">Performance</text>
-  <text x="652" y="506" font-size="10.5" fill="#6b21a8">warm daemon · keep_alive · parallel batch</text>
+  <text x="652" y="506" font-size="10.5" fill="#6b21a8">warm daemon (locate+batch) · keep_alive · session-warm</text>
 </svg>
