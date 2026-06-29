@@ -32,6 +32,7 @@ import http from "node:http";
 import { execSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 import { definitionSearches, detectLang } from "./defn-patterns.mjs";
+import { logActivity } from "./activity-log.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -876,6 +877,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
   const cacheable = !noCache && !(fp.head && fp.dirty); // skip cache on a dirty git tree (content in flux)
   const key = cacheKey(MODEL, PROJECT, query);
   let out, trace, acct, cached = false;
+  const t0 = Date.now();
   const hit = cacheable ? cacheRead(key, fp) : null;
   if (hit) {
     ({ answer: out, trace, acct } = hit);
@@ -890,6 +892,12 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     if (cacheable) cacheWrite(key, fp, { answer: out, trace, acct });
   }
   const savings = recordSavings(acct, out); // credited even on a cache hit (Claude avoided the cost again)
+  // Activity bus: a locate via def_search is its own kind; otherwise generic "locate". tools = trace tool names.
+  const toolNames = (trace || []).map((t) => t.tool);
+  logActivity({
+    project: PROJECT, kind: toolNames[0] === "def_search" ? "def_search" : "locate", task: query,
+    result: out, ms: Date.now() - t0, cached, savings, tools: toolNames,
+  });
   return { q: query, answer: out, trace, cached, savings };
 }
 
@@ -935,6 +943,7 @@ async function main() {
       { outTok: origTok, rawTok: origTok, byTool: { digest: { calls: 1, outTok: origTok, rawTok: origTok } } },
       brief,
     );
+    logActivity({ project: PROJECT, kind: "digest", task: srcArg || "(stdin)", result: brief, cached, savings });
     if (wantJson) process.stdout.write(JSON.stringify({ mode: "digest", source: srcArg || "(stdin)", brief, savings, cached }) + "\n");
     else process.stdout.write("\n" + brief + "\n");
     return;
@@ -968,6 +977,7 @@ async function main() {
       { outTok: origTok, rawTok: origTok, byTool: { triage: { calls: 1, outTok: origTok, rawTok: origTok } } },
       JSON.stringify(t),
     );
+    logActivity({ project: PROJECT, kind: "triage", task: staged ? "git diff --staged" : "git diff", result: t.summary, savings });
     if (wantJson) process.stdout.write(JSON.stringify({ mode: "triage-diff", ...t, savings }) + "\n");
     else {
       process.stdout.write(`\n${t.summary}\n`);
@@ -992,6 +1002,7 @@ async function main() {
       { outTok: origTok, rawTok: origTok, byTool: { "digest-dir": { calls: 1, outTok: origTok, rawTok: origTok } } },
       answer,
     );
+    logActivity({ project: PROJECT, kind: "digest-dir", task: dirArg, result: overview, savings });
     if (wantJson) process.stdout.write(JSON.stringify({ mode: "digest-dir", dir: dirArg, overview, files, savings }) + "\n");
     else process.stdout.write(`\n${overview}\n\n` + files.map((f) => `• ${f.path}\n  ${f.brief.replace(/\n/g, "\n  ")}`).join("\n\n") + "\n");
     return;
@@ -1027,6 +1038,7 @@ async function main() {
       { outTok: origTok, rawTok: origTok, byTool: { web: { calls: 1, outTok: origTok, rawTok: origTok } } },
       brief,
     );
+    logActivity({ project: PROJECT, kind: "web", task: url, result: brief, savings });
     if (wantJson) process.stdout.write(JSON.stringify({ mode: "web", url, brief, savings }) + "\n");
     else process.stdout.write("\n" + brief + "\n");
     return;

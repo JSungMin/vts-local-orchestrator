@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { createAgent } from "./agent-core.mjs";
 import { loadConfig } from "./config-loader.mjs";
+import { readActivity, ACTIVITY_FILE } from "./activity-log.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = loadConfig().port;
@@ -45,6 +46,16 @@ const ollamaPs = () =>
   });
 setInterval(async () => { const ps = await ollamaPs(); if (ps) broadcast({ type: "ps", text: ps }); }, 4000);
 
+// Watch the shared activity bus so the tree refreshes the instant ANY qvts entry point (CLI/daemon/hook/this
+// dashboard) appends a record. fs.watch can miss events on some platforms, so a slow poll backs it up.
+function pingActivity() { broadcast({ type: "activity-changed" }); }
+try {
+  fs.mkdirSync(path.dirname(ACTIVITY_FILE), { recursive: true });
+  if (!fs.existsSync(ACTIVITY_FILE)) fs.writeFileSync(ACTIVITY_FILE, ""); // so watch has a target
+  fs.watch(ACTIVITY_FILE, { persistent: false }, () => pingActivity());
+} catch { /* watch unavailable — the poll below covers it */ }
+setInterval(pingActivity, 5000);
+
 const HTML = String.raw`<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><title>local LLM ↔ vts live</title>
 <style>
@@ -71,6 +82,24 @@ const HTML = String.raw`<!doctype html>
   .stat{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--bd)}
   .stat b{color:var(--fg)} pre.ps{white-space:pre;overflow:auto;font-size:11px;color:var(--mut);margin:0}
   .cur{color:var(--fg)}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tab{background:var(--panel);border:1px solid var(--bd);color:var(--mut);font-weight:600;padding:6px 12px;border-radius:6px}
+  .tab.on{background:var(--acc);color:#0d1117}
+  details.grp{border:1px solid var(--bd);border-radius:8px;margin:6px 0;background:var(--panel)}
+  details.grp>summary{padding:7px 10px;cursor:pointer;font-weight:700;list-style:none}
+  details.grp>summary::-webkit-details-marker{display:none}
+  details.grp>summary:before{content:"▸ ";color:var(--mut)} details.grp[open]>summary:before{content:"▾ "}
+  details.kind{margin:4px 8px 4px 16px;border-left:2px solid var(--bd)}
+  details.kind>summary{padding:5px 10px;cursor:pointer;color:var(--tool);font-weight:600;list-style:none}
+  details.kind>summary::-webkit-details-marker{display:none}
+  .runs{padding:2px 0 6px 14px}
+  .run{border-top:1px solid var(--bd);padding:5px 10px;font-size:12px}
+  .run .top{display:flex;gap:8px;align-items:center;color:var(--mut)}
+  .run .task{color:var(--fg);font-weight:600} .run .res{color:var(--mut);margin-top:2px;white-space:pre-wrap;word-break:break-word}
+  .badge{font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid var(--bd);color:var(--mut)}
+  .badge.dash{color:var(--acc);border-color:var(--acc)} .badge.cli{color:var(--ok);border-color:var(--ok)}
+  .badge.daemon{color:var(--warn);border-color:var(--warn)} .badge.hook{color:var(--tool);border-color:var(--tool)}
+  .badge.cache{color:var(--warn)} .save{color:var(--ok);margin-left:auto}
 </style></head><body>
 <header>
   <span><span class="dot" id="dot"></span><b id="hmodel">local LLM</b> <span style="color:var(--mut)">↔ vts</span> live</span>
@@ -80,7 +109,12 @@ const HTML = String.raw`<!doctype html>
 <div class="wrap">
   <main>
     <form id="f"><input type="text" id="q" placeholder="예: where is UGameInstance declared? / TakeDamage 호출처" autocomplete="off"><button id="go">Run</button></form>
+    <div class="tabs">
+      <button class="tab on" data-t="live">Live run</button>
+      <button class="tab" data-t="act">Activity — 모든 qvts <span class="pill" id="actCount"></span></button>
+    </div>
     <div id="log"></div>
+    <div id="tree" style="display:none"></div>
   </main>
   <aside>
     <h3>run stats</h3>
@@ -134,6 +168,7 @@ es.onmessage=e=>{const ev=JSON.parse(e.data);
   else if(ev.type==='final'){dot.className='dot on';set('st','done');applyStats(ev.stats);el('final','🟢 final answer',ev.answer);}
   else if(ev.type==='stopped'){dot.className='dot on';set('st','stopped');applyStats(ev.stats);el('stop','🟡 stopped: '+ev.reason,'');}
   else if(ev.type==='ps'){document.getElementById('ps').textContent=ev.text;}
+  else if(ev.type==='activity-changed'){loadActivity();}
 };
 let cumV=0,cumG=0;
 const fmt=n=>(n||0).toLocaleString();
@@ -158,6 +193,65 @@ async function loadLedger(){try{const j=await (await fetch('/savings')).json();
   document.getElementById('lt').textContent=tools.length?tools.map(([t,v])=>t+': '+v.calls+' call(s)').join('\n'):'(no data yet)';
 }catch{}}
 loadLedger(); setInterval(loadLedger,5000);
+
+// ---- Activity tab: project > kind > run hierarchy (every qvts unit of work, all entry points) ----
+const tabs=document.querySelectorAll('.tab');
+tabs.forEach(t=>t.addEventListener('click',()=>{
+  tabs.forEach(x=>x.classList.remove('on'));t.classList.add('on');
+  const act=t.dataset.t==='act';
+  document.getElementById('tree').style.display=act?'block':'none';
+  document.getElementById('log').style.display=act?'none':'block';
+  if(act)loadActivity();
+}));
+const KIND_ICON={locate:'🧭',def_search:'🎯',digest:'📑',['digest-dir']:'📚',triage:'🩺',web:'🌐'};
+const short=p=>{if(!p)return '(no project)';const s=p.replace(/[\\/]+$/,'').split(/[\\/]/);return s.slice(-2).join('/');};
+function hhmmss(ts){try{return new Date(ts).toLocaleTimeString();}catch{return '';}}
+function renderActivity(items){
+  const tree=document.getElementById('tree');
+  document.getElementById('actCount').textContent=items.length;
+  if(!items.length){tree.innerHTML='<div class="pill" style="padding:10px">아직 활동 없음 — qvts가 (대시보드/CLI/위임/hook 어디서든) 일하면 여기 쌓입니다.</div>';return;}
+  // group: project → kind → runs
+  const byProj={};
+  for(const a of items){const p=a.project||'(no project)';(byProj[p]=byProj[p]||{});const k=a.kind||'?';(byProj[p][k]=byProj[p][k]||[]).push(a);}
+  // preserve open/closed state across refreshes
+  const openState={};tree.querySelectorAll('details').forEach(d=>{if(d.dataset.key)openState[d.dataset.key]=d.open;});
+  tree.innerHTML='';
+  for(const p of Object.keys(byProj).sort()){
+    const kinds=byProj[p];const pTot=Object.values(kinds).reduce((n,a)=>n+a.length,0);
+    const pSave=Object.values(kinds).flat().reduce((n,a)=>n+((a.savings&&a.savings.savedVsGrep)||0),0);
+    const pd=document.createElement('details');pd.className='grp';pd.dataset.key='p:'+p;pd.open=openState['p:'+p]!==false;
+    const ps=document.createElement('summary');ps.innerHTML='<b>'+esc(short(p))+'</b> <span class="pill">'+pTot+' runs · ~'+fmt(pSave)+' tok saved</span>';
+    pd.appendChild(ps);
+    for(const k of Object.keys(kinds).sort()){
+      const runs=kinds[k].slice().reverse();
+      const kSave=runs.reduce((n,a)=>n+((a.savings&&a.savings.savedVsGrep)||0),0);
+      const kd=document.createElement('details');kd.className='kind';kd.dataset.key='k:'+p+'/'+k;kd.open=!!openState['k:'+p+'/'+k];
+      const ks=document.createElement('summary');ks.innerHTML=(KIND_ICON[k]||'•')+' '+esc(k)+' <span class="pill">'+runs.length+' · ~'+fmt(kSave)+' saved</span>';
+      kd.appendChild(ks);
+      const box=document.createElement('div');box.className='runs';
+      for(const a of runs){
+        const r=document.createElement('div');r.className='run';
+        const via=a.via||'cli';const sg=(a.savings&&a.savings.savedVsGrep)||0;
+        const top=document.createElement('div');top.className='top';
+        top.innerHTML='<span>'+hhmmss(a.ts)+'</span>'
+          +'<span class="badge '+via+'">'+via+'</span>'
+          +(a.cached?'<span class="badge cache">cache</span>':'')
+          +(a.ms!=null?'<span>'+(a.ms/1000).toFixed(1)+'s</span>':'')
+          +(sg?'<span class="save">↓'+fmt(sg)+' tok</span>':'');
+        const task=document.createElement('div');task.className='task';task.textContent=a.task||'';
+        const res=document.createElement('div');res.className='res';res.textContent=(a.result||'').slice(0,300);
+        r.appendChild(top);r.appendChild(task);if(a.result)r.appendChild(res);
+        if(a.tools&&a.tools.length){const tl=document.createElement('div');tl.className='pill';tl.textContent=a.tools.join(' → ');r.appendChild(tl);}
+        box.appendChild(r);
+      }
+      kd.appendChild(box);pd.appendChild(kd);
+    }
+    tree.appendChild(pd);
+  }
+}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+async function loadActivity(){try{const j=await (await fetch('/activity?limit=800')).json();renderActivity(j);}catch{}}
+loadActivity();
 </script></body></html>`;
 
 const server = http.createServer(async (req, res) => {
@@ -190,6 +284,14 @@ const server = http.createServer(async (req, res) => {
       finally { busy = false; }
     });
     return;
+  }
+  if (url === "/activity") {
+    // The shared activity bus — every qvts unit of work (locate/def_search/digest/digest-dir/triage/web)
+    // from the CLI, daemon, Read-hook, and this dashboard. Local read only. ?limit=N (default 800).
+    const q = (req.url || "").split("?")[1] || "";
+    const limit = Math.min(5000, Math.max(1, Number(new URLSearchParams(q).get("limit")) || 800));
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    return res.end(JSON.stringify(readActivity(limit)));
   }
   if (url === "/savings") {
     // cumulative token-savings ledger (~/.vts-local/savings.json) — local read only.

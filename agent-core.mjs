@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 import { definitionSearches, detectLang } from "./defn-patterns.mjs";
+import { logActivity } from "./activity-log.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -350,7 +351,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
 
   onEvent({ type: "ready", project, model: MODEL, tools: tools.map((t) => t.name) });
 
-  async function run(task) {
+  async function runInner(task) {
     const messages = [{ role: "system", content: SYSTEM }, { role: "user", content: task }];
     const trace = [];
     const executed = new Map();
@@ -479,6 +480,18 @@ export async function createAgent({ onEvent = () => {} } = {}) {
     const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: MAX_STEPS, savings: savings(ans) };
     onEvent({ type: "stopped", reason: `hit ${MAX_STEPS}-step limit`, trace, stats });
     return { answer: ans, trace, stats };
+  }
+
+  // Wrap runInner so EVERY dashboard run (final or stopped — all return {answer,trace,stats}) is recorded on
+  // the shared activity bus, the same one the CLI/daemon/hook write to, for the dashboard's project>kind>run tree.
+  async function run(task) {
+    const r = await runInner(task);
+    const tn = (r.trace || []).map((t) => t.tool);
+    logActivity({
+      project, kind: tn[0] === "def_search" ? "def_search" : "locate", via: "dashboard", task,
+      result: r.answer, ms: r.stats && r.stats.ms, savings: r.stats && r.stats.savings, tools: tn,
+    });
+    return r;
   }
 
   return { run, project, model: MODEL, tools: tools.map((t) => t.name), close: () => client.close() };

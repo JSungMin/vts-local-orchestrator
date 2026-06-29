@@ -9,6 +9,9 @@ Modelfile.generated
 # (a denylist of secrets committed in plaintext would itself be the leak). See scripts/secret-scan.mjs.
 .secret-patterns
 
+# local activity bus (task/result text — may reference private code) — local-only, never commit
+activity.jsonl
+
 # runtime / test artifacts (may contain local paths + code identifiers)
 *.log
 *.log.out
