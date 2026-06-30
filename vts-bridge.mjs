@@ -31,8 +31,9 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { execSync, execFileSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
-import { definitionSearches, detectLang } from "./defn-patterns.mjs";
+import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity, logLive, logFallback, isFailAnswer, liveRuns } from "./activity-log.mjs";
+import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -388,7 +389,6 @@ function sanitizeScopeArgs(name, args) {
 // before forward-decl) and returns the first that matches. This removes the small model's biggest locate
 // failure: searching the BARE name (floods with usages/#includes/comments → the time-box buries the decl).
 // One well-shaped navigation primitive beats many bare text scans (RepoNavigator/OrcaLoca localization).
-const DEF_EMPTY = /\bno (text |symbol )?match|\bnot found\b|\(0\)/i;
 // search_text decorates its result with model-facing CHROME — a "↪ … looks like a symbol …" steer, a
 // "[completeness: …]" cert, a "Looking for something in a LOG?" hint, and a "✓ Saved … tok" savings line.
 // That guidance is for a human/Claude choosing the next tool; inside def_search (whose ONLY job is to return
@@ -407,55 +407,82 @@ async function defSearch(client, args) {
   const sym = String(args.name || args.symbol || args.q || "").trim();
   if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
   const lang = (args.lang && String(args.lang).toLowerCase()) || detectLang(PROJECT) || "";
-  const cands = definitionSearches(sym, lang || undefined).slice(0, 6);
-
-  // Run the candidate patterns (specific→broad order preserved, so the first HIT is the best-shaped decl and
-  // we never reach the bare-name pattern that floods with usages). On a GIANT tree each text walk can time-box
-  // before covering it → a FALSE "no match"; def_search used to compound that across all patterns. So: if every
-  // pattern came back empty BUT at least one walk was time-boxed (inconclusive, not a real 0), retry ONCE
-  // scoped to the source root (Source/ on a UE tree, src/ otherwise) where the walk COMPLETES and is
-  // authoritative. Output is chrome-stripped (no steer/cert/log/savings) — def_search returns just the hits.
+  const cands = definitionSearches(sym, lang || undefined);
+  // SPECIFIC patterns (type/enum/alias/field/function-def…) are run together in ONE combined walk so a single
+  // search returns EVERY declaration kind at once — a class AND a member field both surface, ranked, instead of
+  // the first-matching pattern preempting the rest (the old first-match returned `class FooSignificance` and
+  // never reached the `uint8 Significance` field). The BARE-name pattern (function-decl/callable/method) is
+  // EXCLUDED from the combine — it matches call sites too and would flood — and kept only as a last-resort
+  // fallback when the specific patterns find nothing.
+  const BROAD = new Set(["function-decl", "callable", "method"]);
+  const specific = cands.filter((c) => !BROAD.has(c.kind));
+  const broad = cands.filter((c) => BROAD.has(c.kind));
   const sourceRoot = () => {
     for (const d of ["Source", "source", "src"]) {
       try { const p = path.join(PROJECT, d); if (fs.statSync(p).isDirectory()) return p; } catch { /* none */ }
     }
     return null;
   };
-  const runPatterns = async (root) => {
-    const tried = []; let anyTimeBox = false;
-    for (const c of cands) {
-      let out;
-      try {
-        const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: root } });
-        out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
-        if (r.isError) out = `TOOL ERROR:\n${out}`;
-      } catch (e) {
-        out = `TOOL EXCEPTION: ${e.message}`;
+  const HIT_RE = /^\s*(.+?):(\d+):\s?(.*)$/;
+  const parseHits = (out) => {
+    const hits = [];
+    for (const l of stripVtsChrome(out).split("\n")) {
+      const m = HIT_RE.exec(l);
+      if (!m) continue;
+      const file = m[1], line = Number(m[2]), text = m[3];
+      // assign kind/candIdx by the FIRST specific pattern whose regex matches this line (for rankHits).
+      let candIdx = specific.length, kind = "decl", headerish = false;
+      for (let i = 0; i < specific.length; i++) {
+        try { if (new RegExp(specific[i].q).test(text)) { candIdx = i; kind = specific[i].kind; headerish = specific[i].headerish; break; } } catch { /* bad regex → skip */ }
       }
-      tried.push(c.q);
-      const errored = /^TOOL E/.test(out);
-      const timeBoxed = TIME_BOXED.test(out);
-      if (timeBoxed) anyTimeBox = true;
-      const hit = !DEF_EMPTY.test(out) && !errored;
-      process.stderr.write(`  · def_search[${lang || "auto"}] /${c.q}/ @ ${root === PROJECT ? "tree" : "scoped"} → ${hit ? "HIT" : timeBoxed ? "(timeout)" : "(0)"}\n`);
-      if (hit) return { hit: true, body: `def_search(${sym}, lang=${lang || "auto"}) [${c.kind}]:\n${stripVtsChrome(out)}` };
+      hits.push({ file, line, text, candIdx, kind, headerish });
     }
-    return { hit: false, tried, anyTimeBox };
+    return hits;
+  };
+  // Run a set of patterns as ONE combined alternation walk. Returns { hits, timeBoxed, errored }.
+  const runCombined = async (patterns, root) => {
+    if (!patterns.length) return { hits: [], timeBoxed: false, errored: false };
+    const q = patterns.map((c) => `(?:${c.q})`).join("|");
+    let out;
+    try {
+      const r = await client.callTool({ name: "search_text", arguments: { q, projectPath: root } });
+      out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
+      if (r.isError) return { hits: [], timeBoxed: false, errored: true };
+    } catch (e) {
+      return { hits: [], timeBoxed: false, errored: true, msg: e.message };
+    }
+    return { hits: parseHits(out), timeBoxed: TIME_BOXED.test(out) };
+  };
+  const format = (hits) => {
+    const ranked = rankHits(hits).slice(0, 8);
+    const kinds = [...new Set(ranked.map((h) => h.kind))].join(", ");
+    return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]:\n` +
+      ranked.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
   };
 
-  let res = await runPatterns(PROJECT);
-  if (res.hit) return res.body;
-  // Inconclusive (timed out, not a real 0) → one scoped retry where the scan can finish.
-  const src = res.anyTimeBox ? sourceRoot() : null;
-  if (src) {
-    process.stderr.write(`  · def_search: tree scan timed out → retry scoped to ${src}\n`);
-    const res2 = await runPatterns(src);
-    if (res2.hit) return res2.body;
-    if (!res2.anyTimeBox) return `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, so this 0 is authoritative). The name may be spelled differently or absent; try a short fragment via search_text.`;
-    return `inconclusive — def_search(${sym}) scans kept timing out even scoped to ${src}. Narrow further (a subdir) or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat this as absent.`;
+  // 1) specific patterns, combined, on the whole tree.
+  let r = await runCombined(specific, PROJECT);
+  process.stderr.write(`  · def_search[${lang || "auto"}] specific×${specific.length} @ tree → ${r.hits.length ? `${r.hits.length} hit(s)` : r.timeBoxed ? "(timeout)" : "(0)"}\n`);
+  if (r.hits.length) return format(r.hits);
+  // 2) timed out (inconclusive) → retry scoped to the source root where the scan completes.
+  if (r.timeBoxed) {
+    const src = sourceRoot();
+    if (src) {
+      process.stderr.write(`  · def_search: tree scan timed out → retry scoped to ${src}\n`);
+      const r2 = await runCombined(specific, src);
+      if (r2.hits.length) return format(r2.hits);
+      if (r2.timeBoxed) return `inconclusive — def_search(${sym}) scans kept timing out even scoped to ${src}. Narrow further or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat as absent.`;
+      // scoped scan completed empty → fall through to the broad fallback on the scoped root.
+      const rb = await runCombined(broad, src);
+      if (rb.hits.length) return format(rb.hits);
+      return `no match — def_search(${sym}) found no declaration under ${src} (scoped scan COMPLETE, authoritative). The name may be spelled differently; try search_text with a fragment or find_files.`;
+    }
+    return `inconclusive — def_search(${sym}) tree scan timed out and no source root was found to scope to. Pass a narrower projectPath or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat as absent.`;
   }
-  if (res.anyTimeBox) return `inconclusive — def_search(${sym}) tree scan timed out before finishing and no source root was found to scope to. Pass a narrower projectPath or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat this as absent.`;
-  return `no match — def_search(${sym}) tried ${res.tried.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, 0 is authoritative). The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
+  // 3) specific completed empty → last-resort broad (bare-name) pattern, same root.
+  const rb = await runCombined(broad, PROJECT);
+  if (rb.hits.length) return format(rb.hits);
+  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative). The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
 }
 
 // Extract balanced {...} / [...] JSON blobs embedded in free text (one level of nesting tracking).
@@ -935,6 +962,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
           dupCount = 0;
           process.stderr.write(`  · ${name}(${JSON.stringify(args)})\n`);
           prog({ kind: "tool", tool: name, args });
+          const _t0 = Date.now();
           try {
             const out = await client.callTool({ name, arguments: args });
             resultText = (out.content || [])
@@ -943,6 +971,13 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
             if (out.isError) resultText = `TOOL ERROR:\n${resultText}`;
           } catch (e) {
             resultText = `TOOL EXCEPTION: ${e.message}`;
+          }
+          // LSP circuit-breaker ledger: record whether this index-backed tool actually worked, and how long it
+          // took, so the NEXT run can drop it (unindexed tree → always fails ~16s) or size its timeout (slow
+          // index). A timeout / error / empty-on-an-index-tool counts as a failure.
+          if (LSP_TRACK.has(name)) {
+            const okLsp = !/^TOOL E|timed out|workspace\/symbol|not ready|no .*index/i.test(resultText);
+            recordLspOutcome(PROJECT, name, okLsp, Date.now() - _t0);
           }
           prog({ kind: "result", tool: name, preview: resultText.slice(0, 160) });
           executed.set(sig, resultText);
@@ -1376,11 +1411,25 @@ async function main() {
   const NARROW_HARD = /^hard$/i.test(process.env.QVTS_AUTO_NARROW || "");
   const INDEX_USABLE = clangdIndexUsable(PROJECT);
   const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
+  // LSP circuit breaker: learned per project across runs (lsp-stats). If the index-backed tools have a recent
+  // history of ALL failures (timeouts) with zero successes, the index is provably unusable here — so DROP them
+  // up front (this run) instead of wasting ~16s/call rediscovering that. If instead they DO succeed but slowly,
+  // size the per-request timeout to ~p90 of the observed success latency. Off with QVTS_AUTO_NARROW=off.
+  const LSP_VERDICT = NARROW_OFF ? { circuitOpen: false, suggestedTimeoutMs: null, fails: 0 } : lspVerdict(PROJECT);
+  const CIRCUIT_OPEN = LSP_VERDICT.circuitOpen;
   // Bounds passed to the vs-search spawn. VTS_LSP_TIMEOUT_MS caps EACH LSP request (clangd's per-query
   // timeout — a slow/loading persisted index fails here); VTS_LSP_INDEX_WAIT_MS bounds the cold warm-up
-  // block. Short when fast-failing (~seconds, not 30s/120s); default otherwise. Explicit env always wins.
-  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000");
-  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? (FAST_FAIL ? "2000" : "15000");
+  // block. Short when fast-failing (~seconds, not 30s/120s); default otherwise. Explicit env always wins, then
+  // the learned p90, then the static default.
+  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
+  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN) ? "2000" : "15000");
+  if (CIRCUIT_OPEN) {
+    process.stderr.write(
+      `[vts-local] LSP circuit OPEN for ${PROJECT} — index-backed tools (search_symbol/find_references/…) ` +
+        `failed ${LSP_VERDICT.fails}× recently with no success; dropping them this run (no index). Using ` +
+        `def_search/search_text/find_files. Reset: delete ~/.vts-local/lsp-stats.json or QVTS_AUTO_NARROW=off.\n`,
+    );
+  }
   // Text-walk budget for search_text/find_files (vs-token-safer's lexical tier). When the LSP tier is
   // fast-failing (unindexed C/C++), text scan is the ONLY working locator — give it a longer budget so a big
   // tree finishes instead of false-negative-aborting at 4s. Normal trees keep 4s. Explicit env always wins.
@@ -1506,9 +1555,9 @@ async function main() {
     // Only HARD mode removes the clangd-backed tools. SOFT (default) keeps them and relies on the short
     // LSP timeouts above to fast-fail; OFF keeps them with the normal long waits. (INDEX_USABLE / NARROW_HARD
     // were computed before the spawn.)
-    if (NARROW_HARD && !INDEX_USABLE) {
+    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN) {
       requested = requested.filter((n) => !INDEX_TOOLS.has(n));
-      process.stderr.write(
+      if (!CIRCUIT_OPEN) process.stderr.write(
         `[vts-local] QVTS_AUTO_NARROW=hard and no clangd index for ${PROJECT} — exposing index-free ` +
           `locators only (generate compile_commands.json or set QVTS_TOOLS to enable symbol search).\n`,
       );
