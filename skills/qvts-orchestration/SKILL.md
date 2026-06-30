@@ -55,6 +55,10 @@ READ; only a compact brief returns:
 - `qvts digest "<file>" --focus "<question>"` → shortest faithful brief (the local model reads the file).
 - `qvts digest-dir "<dir>" --focus "<question>"` → per-file briefs + an overview for a whole module.
 - `qvts triage-diff [--staged]` → a git diff → `{summary, hotspots[], open[]}` so you open only flagged files.
+- `qvts vcs <p4|git> <read-only sub> [args] [--focus "..."]` → run a big version-control query (e.g.
+  `qvts vcs p4 opened`, `qvts vcs git status`, `qvts vcs git log -20`) and get back a short summary instead of
+  the raw dump. Read-only subcommands only (mutating p4/git ops are refused). Don't run `p4 opened` /
+  `git status` / `git log` in Bash just to read them — the full list lands in your context; route them here.
 
 All are content-cached and credit the savings ledger. `Read` a file directly only when you need its exact
 bytes to EDIT it, or it's small / just-edited (already in context). This is the "delegate reading, not just
