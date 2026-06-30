@@ -12,7 +12,7 @@ import { ensureDeps } from "./scripts/ensure-deps.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox, hasSyntacticIndex } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
@@ -114,14 +114,19 @@ function toOllamaTool(t) {
 }
 
 const ROOT_ARGS = ["projectPath", "root", "cwd"];
+// When ONLY the split-root cluster has a syntactic symbol index, route symbol queries to it (engine symbols
+// resolve even when scoped to the game sub-project). createAgent sets this. Mirrors vts-bridge.mjs.
+let SYMBOL_ROOT_OVERRIDE = null;
+const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols"]);
 function injectProject(toolSchema, args, project) {
   if (!project) return args;
   const props = toolSchema?.inputSchema?.properties || {};
+  const root = (SYMBOL_ROOT_OVERRIDE && SYMBOL_INDEX_TOOLS.has(toolSchema?.name)) ? SYMBOL_ROOT_OVERRIDE : project;
   for (const k of ROOT_ARGS) {
     // ALWAYS override — the model must not choose the project root (it emits placeholders like
     // "<your-project-path>" or wrong paths). The bridge knows the real target; force it.
     if (k in props) {
-      args[k] = project;
+      args[k] = root;
       break;
     }
   }
@@ -426,6 +431,14 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const IDX_STATE = clangdIndexState(project);
   const NO_INDEX = !NARROW_OFF && !NARROW_SOFT && (IDX_STATE === "none" || IDX_STATE === "toobig");
   const FAST_FAIL = !INDEX_USABLE && NARROW_SOFT;
+  // Syntactic (tree-sitter) symbol index — answers search_symbol/document_symbols with no clangd. Mirrors
+  // vts-bridge.mjs: keep those tools when one exists, and route symbol queries to the cluster index if only it
+  // has one (engine symbols resolve from a game sub-project).
+  const _wider = widenRoot(project);
+  const SYN_AT_PROJECT = hasSyntacticIndex(project);
+  const SYN_AT_CLUSTER = _wider ? hasSyntacticIndex(_wider) : false;
+  const HAS_SYN = SYN_AT_PROJECT || SYN_AT_CLUSTER;
+  SYMBOL_ROOT_OVERRIDE = (SYN_AT_CLUSTER && !SYN_AT_PROJECT) ? _wider : null;
   // LSP circuit breaker (learned per project across runs; see lsp-stats / vts-bridge.mjs). Mirror.
   const LSP_VERDICT = NARROW_OFF ? { circuitOpen: false, suggestedTimeoutMs: null } : lspVerdict(project);
   const CIRCUIT_OPEN = LSP_VERDICT.circuitOpen;
@@ -447,7 +460,12 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   } else {
     requested = [...DEFAULT_TOOLS];
     // Only HARD mode drops the clangd-backed tools; SOFT/OFF keep them (soft relies on the short timeouts).
-    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
+    // A syntactic index keeps search_symbol/document_symbols/read_symbol (tree-sitter tier). Mirrors vts-bridge.
+    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) {
+      const SYN_OK = new Set(["search_symbol", "document_symbols", "read_symbol"]);
+      const dropSet = HAS_SYN ? new Set([...INDEX_TOOLS].filter((t) => !SYN_OK.has(t))) : INDEX_TOOLS;
+      requested = requested.filter((n) => !dropSet.has(n));
+    }
   }
   const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
