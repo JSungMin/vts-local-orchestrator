@@ -46,6 +46,53 @@ function resolveVtsServer() {
 // background-index above ~15k TUs. So: narrow C/C++ when there's no compile DB, or the compile DB has more
 // TUs than the threshold. tsserver/pyright (JS/TS/Python) need no compile DB and are never narrowed.
 // Returns false → caller drops the index-dependent tools. Bounded (reads one JSON; never walks the tree).
+// Detailed index state so the caller can distinguish "definitively no index" (no compile DB → symbol tools
+// CANNOT work → drop them UP FRONT, don't even probe) from "index might be slow/partial" (huge DB → soft
+// fast-fail + let the circuit breaker learn). Returns:
+//   "na"     — not a C/C++ project (clangd isn't the backend) → don't narrow.
+//   "none"   — C/C++ but NO compile_commands.json anywhere → clangd can't index → drop symbol tools up front.
+//   "toobig" — C/C++ with a compile DB above the TU threshold → index is slow/throttled → soft fast-fail.
+//   "usable" — C/C++ with a workable compile DB → keep symbol tools.
+export function clangdIndexState(project) {
+  if (!project) return "na";
+  let entries = [];
+  try { entries = fs.readdirSync(project, { withFileTypes: true }); } catch { return "na"; }
+  let isCpp = entries.some((e) => {
+    const n = e.name.toLowerCase();
+    return n.endsWith(".uproject") || n.endsWith(".sln") || /\.(c|cc|cpp|cxx|h|hpp|hh|hxx)$/.test(n);
+  });
+  if (!isCpp) {
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      try {
+        if (fs.readdirSync(path.join(project, e.name)).some((f) => /\.(cpp|h|hpp|cc|cxx)$/i.test(f))) { isCpp = true; break; }
+      } catch { /* ignore */ }
+    }
+  }
+  if (!isCpp) return "na";
+  const findCdb = () => {
+    const cands = [path.join(project, "compile_commands.json")];
+    for (const e of entries) if (e.isDirectory()) cands.push(path.join(project, e.name, "compile_commands.json"));
+    try {
+      const db = process.env.VTS_DB_DIR || path.join(os.homedir(), ".vs-token-safer", "db");
+      const base = path.basename(project).toLowerCase();
+      for (const e of (fs.existsSync(db) ? fs.readdirSync(db) : [])) {
+        if (e.toLowerCase().startsWith(base)) cands.push(path.join(db, e, "compile_commands.json"));
+      }
+    } catch { /* ignore */ }
+    for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch { /* next */ } }
+    return null;
+  };
+  const cdb = findCdb();
+  if (!cdb) return "none"; // C/C++ with no compile DB → clangd can't index
+  const max = Number(process.env.QVTS_NARROW_TU_MAX || 15000);
+  try {
+    const arr = JSON.parse(fs.readFileSync(cdb, "utf8"));
+    if (Array.isArray(arr)) return arr.length <= max ? "usable" : "toobig";
+  } catch { /* unreadable → treat as too-risky */ }
+  return "toobig";
+}
+
 export function clangdIndexUsable(project) {
   if (!project) return true;
   let entries = [];

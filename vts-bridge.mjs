@@ -30,7 +30,7 @@ import readline from "node:readline";
 import crypto from "node:crypto";
 import http from "node:http";
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable, clangdIndexState } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity, logLive, logFallback, isFailAnswer, liveRuns } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
@@ -1409,8 +1409,18 @@ async function main() {
   // and hard-narrow only ever engage on an UNUSABLE C/C++ index; other languages are untouched.
   const NARROW_OFF = /^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
   const NARROW_HARD = /^hard$/i.test(process.env.QVTS_AUTO_NARROW || "");
+  const NARROW_SOFT = /^soft$/i.test(process.env.QVTS_AUTO_NARROW || ""); // opt back into "try then fall back"
   const INDEX_USABLE = clangdIndexUsable(PROJECT);
-  const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
+  // UPFRONT detection (the key win): if we can tell BEFORE spawning that clangd's index can't serve symbols —
+  // a C/C++ tree with NO compile_commands.json ("none"), OR a compile DB so large vs-token-safer throttles/
+  // disables clangd's index ("toobig") — then symbol tools provably won't work. Drop them from the START
+  // instead of paying ~16s/call to rediscover it (and instead of waiting for the circuit breaker to learn it
+  // over several failures). Empirically these never succeed; the circuit breaker remains for the genuinely
+  // AMBIGUOUS case (a "usable" DB whose clangd still fails at runtime — corrupt/mid-rebuild). Escapes:
+  // QVTS_AUTO_NARROW=soft → old try-then-fall-back; =off → keep every tool with long waits.
+  const IDX_STATE = clangdIndexState(PROJECT);
+  const NO_INDEX = !NARROW_OFF && !NARROW_SOFT && (IDX_STATE === "none" || IDX_STATE === "toobig");
+  const FAST_FAIL = !INDEX_USABLE && NARROW_SOFT; // soft mode = the legacy "try with short timeouts" path
   // LSP circuit breaker: learned per project across runs (lsp-stats). If the index-backed tools have a recent
   // history of ALL failures (timeouts) with zero successes, the index is provably unusable here — so DROP them
   // up front (this run) instead of wasting ~16s/call rediscovering that. If instead they DO succeed but slowly,
@@ -1421,19 +1431,29 @@ async function main() {
   // timeout — a slow/loading persisted index fails here); VTS_LSP_INDEX_WAIT_MS bounds the cold warm-up
   // block. Short when fast-failing (~seconds, not 30s/120s); default otherwise. Explicit env always wins, then
   // the learned p90, then the static default.
-  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
-  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN) ? "2000" : "15000");
-  if (CIRCUIT_OPEN) {
+  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
+  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN || NO_INDEX) ? "2000" : "15000");
+  if (NO_INDEX) {
+    const why = IDX_STATE === "none"
+      ? "no compile_commands.json — clangd has no index"
+      : "compile DB too large (clangd index throttled/disabled above the TU threshold)";
+    process.stderr.write(
+      `[vts-local] ${why} for ${PROJECT}, so symbol tools can't serve this tree; dropping them UP FRONT. ` +
+        `Using def_search/search_text/find_files. For semantic symbol/ref search, ` +
+        `${IDX_STATE === "none" ? "generate a compile DB (vts_gen_compile_db / UBT -mode=GenerateClangDatabase)" : "scope to a module (QVTS_NARROW_TU_MAX) or build a scoped index"}. ` +
+        `QVTS_AUTO_NARROW=soft to try anyway, =off to keep all tools.\n`,
+    );
+  } else if (CIRCUIT_OPEN) {
     process.stderr.write(
       `[vts-local] LSP circuit OPEN for ${PROJECT} — index-backed tools (search_symbol/find_references/…) ` +
-        `failed ${LSP_VERDICT.fails}× recently with no success; dropping them this run (no index). Using ` +
+        `failed ${LSP_VERDICT.fails}× recently with no success; dropping them this run. Using ` +
         `def_search/search_text/find_files. Reset: delete ~/.vts-local/lsp-stats.json or QVTS_AUTO_NARROW=off.\n`,
     );
   }
   // Text-walk budget for search_text/find_files (vs-token-safer's lexical tier). When the LSP tier is
   // fast-failing (unindexed C/C++), text scan is the ONLY working locator — give it a longer budget so a big
   // tree finishes instead of false-negative-aborting at 4s. Normal trees keep 4s. Explicit env always wins.
-  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? (FAST_FAIL ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
+  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
   if (FAST_FAIL) {
     process.stderr.write(
       `[vts-local] unindexed C/C++ — soft fast-fail (per-request ${LSP_TIMEOUT}ms): clangd tools are tried, ` +
@@ -1555,9 +1575,9 @@ async function main() {
     // Only HARD mode removes the clangd-backed tools. SOFT (default) keeps them and relies on the short
     // LSP timeouts above to fast-fail; OFF keeps them with the normal long waits. (INDEX_USABLE / NARROW_HARD
     // were computed before the spawn.)
-    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN) {
+    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) {
       requested = requested.filter((n) => !INDEX_TOOLS.has(n));
-      if (!CIRCUIT_OPEN) process.stderr.write(
+      if (!CIRCUIT_OPEN && !NO_INDEX) process.stderr.write(
         `[vts-local] QVTS_AUTO_NARROW=hard and no clangd index for ${PROJECT} — exposing index-free ` +
           `locators only (generate compile_commands.json or set QVTS_TOOLS to enable symbol search).\n`,
       );
