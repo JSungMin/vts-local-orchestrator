@@ -533,7 +533,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
             } catch (e) { resultText = `TOOL EXCEPTION: ${e.message}`; ok = false; }
             // LSP circuit-breaker ledger (mirror of vts-bridge): record whether this index-backed tool worked.
             if (LSP_TRACK.has(name)) {
-              recordLspOutcome(project, name, !/^TOOL E|timed out|workspace\/symbol|not ready|no .*index/i.test(resultText), Date.now() - _t0);
+              recordLspOutcome(project, name, !/^TOOL E|timed out|workspace\/symbol|not ready|no .*index/i.test(resultText), Date.now() - _t0, /no compile_commands|needs compile_commands|no usable index/i.test(resultText));
             }
             executed.set(sig, resultText);
             const ot = estTok(resultText);

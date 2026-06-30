@@ -977,7 +977,8 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
           // index). A timeout / error / empty-on-an-index-tool counts as a failure.
           if (LSP_TRACK.has(name)) {
             const okLsp = !/^TOOL E|timed out|workspace\/symbol|not ready|no .*index/i.test(resultText);
-            recordLspOutcome(PROJECT, name, okLsp, Date.now() - _t0);
+            const definitive = /no compile_commands|needs compile_commands|no usable index/i.test(resultText);
+            recordLspOutcome(PROJECT, name, okLsp, Date.now() - _t0, definitive);
           }
           prog({ kind: "result", tool: name, preview: resultText.slice(0, 160) });
           executed.set(sig, resultText);

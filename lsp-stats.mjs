@@ -31,25 +31,32 @@ export const LSP_TRACK = new Set(["search_symbol", "find_references", "goto_defi
 const read = () => { try { return JSON.parse(fs.readFileSync(FILE, "utf8")) || {}; } catch { return {}; } };
 const write = (m) => { try { fs.mkdirSync(path.dirname(FILE), { recursive: true }); fs.writeFileSync(FILE, JSON.stringify(m)); } catch { /* best effort */ } };
 
-export function recordLspOutcome(project, tool, ok, ms) {
+// `definitive` marks a failure where clangd EXPLICITLY reported no usable index (no compile_commands.json) —
+// a permanent, non-transient condition (vs a timeout, which could be a slow warm-up). One definitive failure is
+// enough to open the circuit; timeouts need ≥minFails. This catches the case clangdIndexState misses: a parent
+// projectPath (e.g. a vault/monorepo root) whose C/C++ lives several levels down, so the upfront "none/toobig"
+// detection classifies it "na" and never drops the tools — but the runtime truth ("needs compile_commands.json")
+// is unambiguous, so we converge on the next run instead of waiting for 3 timeouts.
+export function recordLspOutcome(project, tool, ok, ms, definitive = false) {
   if (DISABLED || !project || !LSP_TRACK.has(tool)) return;
   const m = read();
   const e = m[project] || (m[project] = { outcomes: [] });
-  e.outcomes.push({ ok: !!ok, ms: Math.round(ms || 0), tool, ts: Date.now() });
+  e.outcomes.push({ ok: !!ok, ms: Math.round(ms || 0), tool, ts: Date.now(), definitive: !ok && !!definitive });
   if (e.outcomes.length > WINDOW) e.outcomes = e.outcomes.slice(-WINDOW);
   write(m);
 }
 
-// Verdict from history. circuitOpen: recent window is ≥minFails failures with ZERO successes → the index is
-// provably unusable for this project, so drop the index tools. suggestedTimeoutMs: when successes DO exist,
-// p90(success ms)·1.3 (clamped) so a slow index gets right-sized time instead of a blanket short timeout.
+// Verdict from history. circuitOpen: ZERO successes AND (≥minFails timeouts OR ANY definitive no-index error) →
+// drop the index tools. suggestedTimeoutMs: when successes DO exist, p90(success ms)·1.3 (clamped) so a slow
+// index gets right-sized time instead of a blanket short timeout.
 export function lspVerdict(project, { minFails = 3 } = {}) {
   if (DISABLED || !project) return { circuitOpen: false, suggestedTimeoutMs: null, successes: 0, fails: 0 };
   const e = read()[project];
   const o = (e && Array.isArray(e.outcomes)) ? e.outcomes : [];
   const succ = o.filter((x) => x.ok);
   const fails = o.filter((x) => !x.ok);
-  const circuitOpen = succ.length === 0 && fails.length >= minFails;
+  const definitive = fails.some((x) => x.definitive);
+  const circuitOpen = succ.length === 0 && (fails.length >= minFails || definitive);
   let suggestedTimeoutMs = null;
   if (succ.length) {
     const ms = succ.map((x) => x.ms).sort((a, b) => a - b);
