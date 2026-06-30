@@ -118,10 +118,12 @@ export function readFallback() {
   try { return JSON.parse(fs.readFileSync(FALLBACK_FILE, "utf8")); } catch { return null; }
 }
 // An answer that means the delegation came up empty (so Claude should be allowed to fall back to direct search).
+// Covers: empty; an explicit no-match; a tool/daemon error; the model producing NO final answer ("(no answer)")
+// or giving up at the step limit ("(stopped: …)") / on a loop — all of which mean Claude must search directly.
 export function isFailAnswer(s) {
   const t = String(s || "").trim();
   if (!t) return true;
-  return /no match|TOOL ERROR|\(error|\(daemon error\)|not found|couldn't find|could not find/i.test(t);
+  return /no match|no answer|\(stopped|TOOL ERROR|\(error|\(daemon error\)|inconclusive|not found|couldn't find|could not find/i.test(t);
 }
 
 // Group live progress events into in-flight runs (newest first) with last-heartbeat age — for `qvts runs`/ping
