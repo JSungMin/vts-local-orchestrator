@@ -12,7 +12,7 @@ import { ensureDeps } from "./scripts/ensure-deps.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable, clangdIndexState } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
@@ -362,16 +362,21 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   // keep them with normal long waits. Fast-fail/hard engage only on an UNUSABLE C/C++ index.
   const NARROW_OFF = /^(0|false|off|no)$/i.test(process.env.QVTS_AUTO_NARROW || "");
   const NARROW_HARD = /^hard$/i.test(process.env.QVTS_AUTO_NARROW || "");
+  const NARROW_SOFT = /^soft$/i.test(process.env.QVTS_AUTO_NARROW || "");
   const INDEX_USABLE = clangdIndexUsable(project);
-  const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
+  // UPFRONT: C/C++ with no compile_commands.json ("none") OR a DB too big for clangd ("toobig") → symbol tools
+  // can't serve it → drop from the start (mirror of vts-bridge). soft = legacy try-path; circuit = ambiguous.
+  const IDX_STATE = clangdIndexState(project);
+  const NO_INDEX = !NARROW_OFF && !NARROW_SOFT && (IDX_STATE === "none" || IDX_STATE === "toobig");
+  const FAST_FAIL = !INDEX_USABLE && NARROW_SOFT;
   // LSP circuit breaker (learned per project across runs; see lsp-stats / vts-bridge.mjs). Mirror.
   const LSP_VERDICT = NARROW_OFF ? { circuitOpen: false, suggestedTimeoutMs: null } : lspVerdict(project);
   const CIRCUIT_OPEN = LSP_VERDICT.circuitOpen;
-  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
-  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN) ? "2000" : "15000");
+  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
+  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN || NO_INDEX) ? "2000" : "15000");
   // Text-walk budget (search_text/find_files). Longer when the LSP tier is fast-failing (unindexed C/C++) so a
   // giant tree's text scan finishes instead of false-negative-aborting at vs-token-safer's 4s default.
-  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? (FAST_FAIL ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
+  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
   const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
   let requested;
   if (toolsSpec) {
@@ -379,7 +384,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   } else {
     requested = [...DEFAULT_TOOLS];
     // Only HARD mode drops the clangd-backed tools; SOFT/OFF keep them (soft relies on the short timeouts).
-    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
+    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
   }
   const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
