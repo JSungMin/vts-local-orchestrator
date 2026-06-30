@@ -13,8 +13,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
-import { definitionSearches, detectLang } from "./defn-patterns.mjs";
+import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity } from "./activity-log.mjs";
+import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -217,7 +218,6 @@ const isEmptyResult = (r) => {
 
 // def_search — synthetic deterministic declaration locator over search_text (see vts-bridge.mjs). Tries the
 // language's definition regexes in priority order and returns the first that matches.
-const DEF_EMPTY = /\bno (text |symbol )?match|\bnot found\b|\(0\)/i;
 const TIME_BOXED = /time-box hit|time-boxed|NOT conclusive|INCONCLUSIVE/i;
 // Strip search_text's model-facing chrome (steer / completeness cert / log hint / savings line) — inside
 // def_search it's pure context waste; we want just the declaration hits. Mirrors vts-bridge.mjs.
@@ -233,42 +233,66 @@ async function defSearch(client, args, project) {
   const sym = String(args.name || args.symbol || args.q || "").trim();
   if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
   const lang = (args.lang && String(args.lang).toLowerCase()) || detectLang(project) || "";
-  const cands = definitionSearches(sym, lang || undefined).slice(0, 6);
+  const cands = definitionSearches(sym, lang || undefined);
+  // Combined-walk: run SPECIFIC patterns together in one search so class AND field both surface (ranked),
+  // instead of the first match preempting. BARE-name pattern excluded from the combine (floods), broad fallback
+  // only when specific find nothing. Mirrors vts-bridge.mjs.
+  const BROAD = new Set(["function-decl", "callable", "method"]);
+  const specific = cands.filter((c) => !BROAD.has(c.kind));
+  const broad = cands.filter((c) => BROAD.has(c.kind));
   const sourceRoot = () => {
     for (const d of ["Source", "source", "src"]) {
       try { const p = path.join(project, d); if (fs.statSync(p).isDirectory()) return p; } catch { /* none */ }
     }
     return null;
   };
-  const runPatterns = async (root) => {
-    let anyTimeBox = false;
-    for (const c of cands) {
-      let out;
-      try {
-        const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: root } });
-        out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
-        if (r.isError) out = `TOOL ERROR:\n${out}`;
-      } catch (e) {
-        out = `TOOL EXCEPTION: ${e.message}`;
+  const HIT_RE = /^\s*(.+?):(\d+):\s?(.*)$/;
+  const parseHits = (out) => {
+    const hits = [];
+    for (const l of stripVtsChrome(out).split("\n")) {
+      const m = HIT_RE.exec(l);
+      if (!m) continue;
+      let candIdx = specific.length, kind = "decl", headerish = false;
+      for (let i = 0; i < specific.length; i++) {
+        try { if (new RegExp(specific[i].q).test(m[3])) { candIdx = i; kind = specific[i].kind; headerish = specific[i].headerish; break; } } catch { /* skip */ }
       }
-      if (TIME_BOXED.test(out)) anyTimeBox = true;
-      if (!DEF_EMPTY.test(out) && !/^TOOL E/.test(out)) {
-        return { hit: true, body: `def_search(${sym}, lang=${lang || "auto"}) [${c.kind}]:\n${stripVtsChrome(out)}` };
-      }
+      hits.push({ file: m[1], line: Number(m[2]), text: m[3], candIdx, kind, headerish });
     }
-    return { hit: false, anyTimeBox };
+    return hits;
   };
-  const res = await runPatterns(project);
-  if (res.hit) return res.body;
-  const src = res.anyTimeBox ? sourceRoot() : null;
-  if (src) {
-    const res2 = await runPatterns(src);
-    if (res2.hit) return res2.body;
-    return res2.anyTimeBox
-      ? `inconclusive — def_search(${sym}) scans timed out even scoped to ${src}; narrow further or raise QVTS_TEXT_TIMEBOX_MS (do NOT treat as absent).`
-      : `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, authoritative).`;
+  const runCombined = async (patterns, root) => {
+    if (!patterns.length) return { hits: [], timeBoxed: false };
+    const q = patterns.map((c) => `(?:${c.q})`).join("|");
+    let out;
+    try {
+      const r = await client.callTool({ name: "search_text", arguments: { q, projectPath: root } });
+      out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
+      if (r.isError) return { hits: [], timeBoxed: false };
+    } catch { return { hits: [], timeBoxed: false }; }
+    return { hits: parseHits(out), timeBoxed: TIME_BOXED.test(out) };
+  };
+  const format = (hits) => {
+    const ranked = rankHits(hits).slice(0, 8);
+    const kinds = [...new Set(ranked.map((h) => h.kind))].join(", ");
+    return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]:\n` +
+      ranked.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
+  };
+  let r = await runCombined(specific, project);
+  if (r.hits.length) return format(r.hits);
+  if (r.timeBoxed) {
+    const src = sourceRoot();
+    if (src) {
+      const r2 = await runCombined(specific, src);
+      if (r2.hits.length) return format(r2.hits);
+      if (r2.timeBoxed) return `inconclusive — def_search(${sym}) scans timed out even scoped to ${src}; narrow further or raise QVTS_TEXT_TIMEBOX_MS (do NOT treat as absent).`;
+      const rb2 = await runCombined(broad, src);
+      if (rb2.hits.length) return format(rb2.hits);
+      return `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, authoritative).`;
+    }
+    return `inconclusive — def_search(${sym}) tree scan timed out; pass a narrower projectPath (do NOT treat as absent).`;
   }
-  if (res.anyTimeBox) return `inconclusive — def_search(${sym}) tree scan timed out; pass a narrower projectPath (do NOT treat as absent).`;
+  const rb = await runCombined(broad, project);
+  if (rb.hits.length) return format(rb.hits);
   return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative).`;
 }
 
@@ -340,8 +364,11 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const NARROW_HARD = /^hard$/i.test(process.env.QVTS_AUTO_NARROW || "");
   const INDEX_USABLE = clangdIndexUsable(project);
   const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
-  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000");
-  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? (FAST_FAIL ? "2000" : "15000");
+  // LSP circuit breaker (learned per project across runs; see lsp-stats / vts-bridge.mjs). Mirror.
+  const LSP_VERDICT = NARROW_OFF ? { circuitOpen: false, suggestedTimeoutMs: null } : lspVerdict(project);
+  const CIRCUIT_OPEN = LSP_VERDICT.circuitOpen;
+  const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
+  const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN) ? "2000" : "15000");
   // Text-walk budget (search_text/find_files). Longer when the LSP tier is fast-failing (unindexed C/C++) so a
   // giant tree's text scan finishes instead of false-negative-aborting at vs-token-safer's 4s default.
   const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? (FAST_FAIL ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
@@ -352,7 +379,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   } else {
     requested = [...DEFAULT_TOOLS];
     // Only HARD mode drops the clangd-backed tools; SOFT/OFF keep them (soft relies on the short timeouts).
-    if (NARROW_HARD && !INDEX_USABLE) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
+    if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN) requested = requested.filter((n) => !INDEX_TOOLS.has(n));
   }
   const allowed = new Set(requested.filter((n) => DEFAULT_TOOLS.has(n) || allowMutation));
 
@@ -493,11 +520,16 @@ export async function createAgent({ onEvent = () => {} } = {}) {
           } else {
             dupCount = 0;
             onEvent({ type: "tool_call", tool: name, args, dup: false });
+            const _t0 = Date.now();
             try {
               const out = await client.callTool({ name, arguments: args });
               resultText = (out.content || []).map((c) => (c.type === "text" ? c.text : JSON.stringify(c))).join("\n");
               if (out.isError) { resultText = `TOOL ERROR:\n${resultText}`; ok = false; }
             } catch (e) { resultText = `TOOL EXCEPTION: ${e.message}`; ok = false; }
+            // LSP circuit-breaker ledger (mirror of vts-bridge): record whether this index-backed tool worked.
+            if (LSP_TRACK.has(name)) {
+              recordLspOutcome(project, name, !/^TOOL E|timed out|workspace\/symbol|not ready|no .*index/i.test(resultText), Date.now() - _t0);
+            }
             executed.set(sig, resultText);
             const ot = estTok(resultText);
             outTokSum += ot;
