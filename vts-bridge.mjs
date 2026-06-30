@@ -32,7 +32,7 @@ import http from "node:http";
 import { execSync, execFileSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 import { definitionSearches, detectLang } from "./defn-patterns.mjs";
-import { logActivity, logLive } from "./activity-log.mjs";
+import { logActivity, logLive, logFallback, isFailAnswer, liveRuns } from "./activity-log.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -389,27 +389,73 @@ function sanitizeScopeArgs(name, args) {
 // failure: searching the BARE name (floods with usages/#includes/comments → the time-box buries the decl).
 // One well-shaped navigation primitive beats many bare text scans (RepoNavigator/OrcaLoca localization).
 const DEF_EMPTY = /\bno (text |symbol )?match|\bnot found\b|\(0\)/i;
+// search_text decorates its result with model-facing CHROME — a "↪ … looks like a symbol …" steer, a
+// "[completeness: …]" cert, a "Looking for something in a LOG?" hint, and a "✓ Saved … tok" savings line.
+// That guidance is for a human/Claude choosing the next tool; inside def_search (whose ONLY job is to return
+// the declaration's file:line) it's pure context waste fed to the small local model. Strip it to the bare hits.
+// `timeBoxed` is preserved separately by the caller — we don't want to silently drop the "inconclusive" signal.
+function stripVtsChrome(text) {
+  return String(text)
+    .split("\n")
+    .filter((l) => !/^↪ /.test(l) && !/^\[completeness:/.test(l) && !/Looking for something in a LOG\?/.test(l) && !/^✓ Saved/.test(l))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+const TIME_BOXED = /time-box hit|time-boxed|NOT conclusive|INCONCLUSIVE/i;
 async function defSearch(client, args) {
   const sym = String(args.name || args.symbol || args.q || "").trim();
   if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
   const lang = (args.lang && String(args.lang).toLowerCase()) || detectLang(PROJECT) || "";
   const cands = definitionSearches(sym, lang || undefined).slice(0, 6);
-  const tried = [];
-  for (const c of cands) {
-    let out;
-    try {
-      const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: PROJECT } });
-      out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
-      if (r.isError) out = `TOOL ERROR:\n${out}`;
-    } catch (e) {
-      out = `TOOL EXCEPTION: ${e.message}`;
+
+  // Run the candidate patterns (specific→broad order preserved, so the first HIT is the best-shaped decl and
+  // we never reach the bare-name pattern that floods with usages). On a GIANT tree each text walk can time-box
+  // before covering it → a FALSE "no match"; def_search used to compound that across all patterns. So: if every
+  // pattern came back empty BUT at least one walk was time-boxed (inconclusive, not a real 0), retry ONCE
+  // scoped to the source root (Source/ on a UE tree, src/ otherwise) where the walk COMPLETES and is
+  // authoritative. Output is chrome-stripped (no steer/cert/log/savings) — def_search returns just the hits.
+  const sourceRoot = () => {
+    for (const d of ["Source", "source", "src"]) {
+      try { const p = path.join(PROJECT, d); if (fs.statSync(p).isDirectory()) return p; } catch { /* none */ }
     }
-    tried.push(c.q);
-    const hit = !DEF_EMPTY.test(out) && !/^TOOL E/.test(out);
-    process.stderr.write(`  · def_search[${lang || "auto"}] /${c.q}/ → ${hit ? "HIT" : "(0)"}\n`);
-    if (hit) return `def_search(${sym}, lang=${lang || "auto"}) — definition pattern /${c.q}/ [${c.kind}]:\n${out}`;
+    return null;
+  };
+  const runPatterns = async (root) => {
+    const tried = []; let anyTimeBox = false;
+    for (const c of cands) {
+      let out;
+      try {
+        const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: root } });
+        out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
+        if (r.isError) out = `TOOL ERROR:\n${out}`;
+      } catch (e) {
+        out = `TOOL EXCEPTION: ${e.message}`;
+      }
+      tried.push(c.q);
+      const errored = /^TOOL E/.test(out);
+      const timeBoxed = TIME_BOXED.test(out);
+      if (timeBoxed) anyTimeBox = true;
+      const hit = !DEF_EMPTY.test(out) && !errored;
+      process.stderr.write(`  · def_search[${lang || "auto"}] /${c.q}/ @ ${root === PROJECT ? "tree" : "scoped"} → ${hit ? "HIT" : timeBoxed ? "(timeout)" : "(0)"}\n`);
+      if (hit) return { hit: true, body: `def_search(${sym}, lang=${lang || "auto"}) [${c.kind}]:\n${stripVtsChrome(out)}` };
+    }
+    return { hit: false, tried, anyTimeBox };
+  };
+
+  let res = await runPatterns(PROJECT);
+  if (res.hit) return res.body;
+  // Inconclusive (timed out, not a real 0) → one scoped retry where the scan can finish.
+  const src = res.anyTimeBox ? sourceRoot() : null;
+  if (src) {
+    process.stderr.write(`  · def_search: tree scan timed out → retry scoped to ${src}\n`);
+    const res2 = await runPatterns(src);
+    if (res2.hit) return res2.body;
+    if (!res2.anyTimeBox) return `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, so this 0 is authoritative). The name may be spelled differently or absent; try a short fragment via search_text.`;
+    return `inconclusive — def_search(${sym}) scans kept timing out even scoped to ${src}. Narrow further (a subdir) or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat this as absent.`;
   }
-  return `no match — def_search(${sym}) tried ${tried.length} definition pattern(s) for lang=${lang || "auto"} and none matched. The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
+  if (res.anyTimeBox) return `inconclusive — def_search(${sym}) tree scan timed out before finishing and no source root was found to scope to. Pass a narrower projectPath or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat this as absent.`;
+  return `no match — def_search(${sym}) tried ${res.tried.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, 0 is authoritative). The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
 }
 
 // Extract balanced {...} / [...] JSON blobs embedded in free text (one level of nesting tracking).
@@ -977,6 +1023,9 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     project: PROJECT, kind: toolNames[0] === "def_search" ? "def_search" : "locate", task: query,
     result: out, ms: Date.now() - t0, cached, savings, tools: toolNames,
   });
+  // Delegation came up dry → drop a fallback marker so vs-token-safer's redirect hook lets Claude search
+  // DIRECTLY for a short window (the protocol's fallback step) instead of re-blocking + trapping it.
+  if (isFailAnswer(out)) logFallback({ query, project: PROJECT });
   return { q: query, answer: out, trace, cached, savings };
 }
 
@@ -985,6 +1034,32 @@ async function main() {
   if (process.argv.includes("--savings")) {
     process.stdout.write(savingsReport() + "\n");
     return;
+  }
+
+  // `qvts runs` / `qvts ping [runId]` — LIVENESS for delegated locates. A run streams heartbeats to live.jsonl
+  // (start/tool/result/final); these read it so the orchestrator can tell "still working" from "dead/empty"
+  // BEFORE abandoning a delegation (the symptom: Claude bailed to direct Read because it couldn't see qvts was
+  // alive). No model, no MCP server. `ping` exits 0 if a run is alive, 1 otherwise (shell-pollable).
+  {
+    const sub0 = process.argv.slice(2)[0];
+    if (sub0 === "runs" || sub0 === "ping") {
+      const asJson = process.argv.includes("--json") || /^(1|true|on|yes)$/i.test(process.env.QVTS_JSON || "");
+      const staleMs = Number(process.env.QVTS_RUN_STALE_MS || 20000);
+      const runs = liveRuns(staleMs);
+      const fmt = (r) => `${r.runId.slice(0, 8)} · ${r.lastStep} (${r.steps} tools) · ${Math.round(r.ageMs / 1000)}s ago · "${r.query}"`;
+      if (sub0 === "ping") {
+        const id = process.argv[3];
+        const pick = id ? runs.find((r) => r.runId === id || r.runId.startsWith(id)) : (runs.find((r) => r.alive) || runs[0]);
+        const alive = !!(pick && pick.alive);
+        if (asJson) process.stdout.write(JSON.stringify(pick ? { runId: pick.runId, alive, ageMs: pick.ageMs, step: pick.lastStep, steps: pick.steps, query: pick.query } : { alive: false, runs: 0 }) + "\n");
+        else process.stdout.write(pick ? `${alive ? "alive" : "stale"} · ${fmt(pick)}\n` : "no runs\n");
+        process.exit(alive ? 0 : 1);
+      }
+      if (asJson) { process.stdout.write(JSON.stringify({ runs: runs.map((r) => ({ runId: r.runId, alive: r.alive, ageMs: r.ageMs, step: r.lastStep, steps: r.steps, project: r.project, query: r.query })) }) + "\n"); return; }
+      if (!runs.length) { process.stdout.write("no recent qvts runs\n"); return; }
+      for (const r of runs) process.stdout.write(`${r.alive ? "● alive" : "○ done "} ${fmt(r)}\n`);
+      return;
+    }
   }
 
   // Reading-delegation subcommands — local model only, NO vs-search server needed.
@@ -1306,6 +1381,10 @@ async function main() {
   // block. Short when fast-failing (~seconds, not 30s/120s); default otherwise. Explicit env always wins.
   const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000");
   const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? (FAST_FAIL ? "2000" : "15000");
+  // Text-walk budget for search_text/find_files (vs-token-safer's lexical tier). When the LSP tier is
+  // fast-failing (unindexed C/C++), text scan is the ONLY working locator — give it a longer budget so a big
+  // tree finishes instead of false-negative-aborting at 4s. Normal trees keep 4s. Explicit env always wins.
+  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? (FAST_FAIL ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
   if (FAST_FAIL) {
     process.stderr.write(
       `[vts-local] unindexed C/C++ — soft fast-fail (per-request ${LSP_TIMEOUT}ms): clangd tools are tried, ` +
@@ -1367,6 +1446,11 @@ async function main() {
       // falls back to the index-free locators instead of hanging 30s/120s. See the NARROW mode block above.
       VTS_LSP_INDEX_WAIT_MS: LSP_INDEX_WAIT,
       VTS_LSP_TIMEOUT_MS: LSP_TIMEOUT,
+      // Lexical-walk budget for search_text/find_files. On a GIANT unindexed C/C++ tree the LSP tools all
+      // time out, so text scan is the ONLY working tier — but vs-token-safer's default 4s walk aborts
+      // mid-tree there and a real match reads as a FALSE "no match" (observed on a UE Source/ tree). Raise it
+      // so the scan can actually finish; normal/indexed trees keep the 4s default. Override: QVTS_TEXT_TIMEBOX_MS.
+      VTS_TEXT_TIMEBOX_MS: TEXT_TIMEBOX,
     },
     stderr: "inherit",
   });

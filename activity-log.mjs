@@ -97,6 +97,54 @@ export function readLive(limit = 200) {
   }
 }
 
+// ---- fallback marker -----------------------------------------------------------------------------
+// When a delegated locate genuinely fails (empty / "no match" / TOOL ERROR), the orchestrator has done its
+// job and come up dry — Claude must now be free to search DIRECTLY (the delegation protocol's fallback step).
+// But vs-token-safer's orchestrator-redirect hook would normally BLOCK that direct search and re-delegate,
+// trapping Claude in a loop (it ends up abandoning search and reading whole files instead). So on a failed
+// delegation we drop a short-lived marker; the redirect hook reads it and OPENS a window where direct
+// vs-search calls pass (warn, not block). The marker is the real signal "the local model already tried and
+// couldn't", not a guess. Single latest record (overwrite); the hook only cares about recency.
+export const FALLBACK_FILE =
+  process.env.QVTS_FALLBACK_FILE || path.join(os.homedir(), ".vts-local", "orch-fallback.json");
+export function logFallback(entry = {}) {
+  if (DISABLED) return;
+  try {
+    fs.mkdirSync(path.dirname(FALLBACK_FILE), { recursive: true });
+    fs.writeFileSync(FALLBACK_FILE, JSON.stringify({ ts: Date.now(), query: CLIP(entry.query, 300), project: entry.project || null }));
+  } catch { /* best-effort */ }
+}
+export function readFallback() {
+  try { return JSON.parse(fs.readFileSync(FALLBACK_FILE, "utf8")); } catch { return null; }
+}
+// An answer that means the delegation came up empty (so Claude should be allowed to fall back to direct search).
+export function isFailAnswer(s) {
+  const t = String(s || "").trim();
+  if (!t) return true;
+  return /no match|TOOL ERROR|\(error|\(daemon error\)|not found|couldn't find|could not find/i.test(t);
+}
+
+// Group live progress events into in-flight runs (newest first) with last-heartbeat age — for `qvts runs`/ping
+// liveness. A run is "alive" if its newest event is within staleMs and it hasn't emitted a final answer.
+export function liveRuns(staleMs = 20000) {
+  const now = Date.now();
+  const byRun = new Map();
+  for (const ev of readLive(400)) {
+    if (!ev.runId) continue;
+    let r = byRun.get(ev.runId);
+    if (!r) { r = { runId: ev.runId, project: ev.project || null, query: ev.query || "", started: ev.ts, last: ev.ts, steps: 0, lastStep: "", done: false }; byRun.set(ev.runId, r); }
+    r.last = Math.max(r.last, ev.ts || 0);
+    if (ev.query && !r.query) r.query = ev.query;
+    if (ev.kind === "tool") { r.steps++; r.lastStep = ev.tool ? `tool ${ev.tool}` : "tool"; }
+    else if (ev.kind === "result") r.lastStep = ev.tool ? `result ${ev.tool}` : "result";
+    else if (ev.kind === "start") r.lastStep = "start";
+    else if (ev.kind === "final") { r.done = true; r.lastStep = "final"; }
+  }
+  return [...byRun.values()]
+    .map((r) => ({ ...r, ageMs: now - r.last, alive: !r.done && now - r.last <= staleMs }))
+    .sort((a, b) => b.last - a.last);
+}
+
 // Read the most recent `limit` activity records (oldest→newest). Bounded read for the dashboard.
 export function readActivity(limit = 500) {
   try {
