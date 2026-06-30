@@ -71,11 +71,17 @@ function maybeTrim() {
 export const LIVE_FILE = process.env.QVTS_LIVE_FILE || path.join(os.homedir(), ".vts-local", "live.jsonl");
 const LIVE_MAX = Number(process.env.QVTS_LIVE_MAX || 400);
 let _liveWrites = 0;
+// Extra fields merged into EVERY live event (set once per process). Used to stamp the spawned vs-search
+// server pid so `qvts reap` can kill a run's orphaned server/clangd if the owning qvts process died.
+let _liveExtra = {};
+export function setLiveExtra(obj) { _liveExtra = { ..._liveExtra, ...(obj || {}) }; }
 export function logLive(ev) {
   if (DISABLED || !ev || !ev.kind) return;
   try {
     fs.mkdirSync(path.dirname(LIVE_FILE), { recursive: true });
-    fs.appendFileSync(LIVE_FILE, JSON.stringify({ ts: Date.now(), ...ev }) + "\n");
+    // Stamp the owning process pid (+ any server pid) so liveness can tell a working run from an orphaned
+    // ZOMBIE (process gone, never emitted `final`) and reap can target the right processes.
+    fs.appendFileSync(LIVE_FILE, JSON.stringify({ ts: Date.now(), pid: process.pid, ..._liveExtra, ...ev }) + "\n");
     if (++_liveWrites % 80 === 0) {
       const lines = fs.readFileSync(LIVE_FILE, "utf8").split("\n").filter(Boolean);
       if (lines.length > LIVE_MAX) fs.writeFileSync(LIVE_FILE, lines.slice(lines.length - LIVE_MAX).join("\n") + "\n");
@@ -126,25 +132,64 @@ export function isFailAnswer(s) {
   return /no match|no answer|\(stopped|TOOL ERROR|\(error|\(daemon error\)|inconclusive|not found|couldn't find|could not find/i.test(t);
 }
 
-// Group live progress events into in-flight runs (newest first) with last-heartbeat age — for `qvts runs`/ping
-// liveness. A run is "alive" if its newest event is within staleMs and it hasn't emitted a final answer.
+// Does a pid refer to a live process? signal 0 doesn't kill — it only probes. EPERM = exists (other user).
+export function processAlive(pid) {
+  if (!pid || !Number.isFinite(pid)) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+// Group live progress events into in-flight runs (newest first) with last-heartbeat age + a STATUS:
+//   done   — emitted a final answer (completed normally).
+//   alive  — no final yet, owning process is running, heartbeat within staleMs (genuinely working).
+//   zombie — no final, and the owning process is GONE: it died mid-run and orphaned its server/clangd.
+//   stale  — no final, process still running but no heartbeat within staleMs (hung), or pid unknown + old.
+// `alive` (bool) is kept for back-compat (ping). `server` carries the run's vs-search server pid if recorded.
 export function liveRuns(staleMs = 20000) {
   const now = Date.now();
   const byRun = new Map();
   for (const ev of readLive(400)) {
     if (!ev.runId) continue;
     let r = byRun.get(ev.runId);
-    if (!r) { r = { runId: ev.runId, project: ev.project || null, query: ev.query || "", started: ev.ts, last: ev.ts, steps: 0, lastStep: "", done: false }; byRun.set(ev.runId, r); }
+    if (!r) { r = { runId: ev.runId, project: ev.project || null, query: ev.query || "", started: ev.ts, last: ev.ts, steps: 0, lastStep: "", done: false, pid: null, server: null }; byRun.set(ev.runId, r); }
     r.last = Math.max(r.last, ev.ts || 0);
     if (ev.query && !r.query) r.query = ev.query;
+    if (ev.pid && !r.pid) r.pid = ev.pid;
+    if (ev.server && !r.server) r.server = ev.server;
     if (ev.kind === "tool") { r.steps++; r.lastStep = ev.tool ? `tool ${ev.tool}` : "tool"; }
     else if (ev.kind === "result") r.lastStep = ev.tool ? `result ${ev.tool}` : "result";
     else if (ev.kind === "start") r.lastStep = "start";
     else if (ev.kind === "final") { r.done = true; r.lastStep = "final"; }
   }
   return [...byRun.values()]
-    .map((r) => ({ ...r, ageMs: now - r.last, alive: !r.done && now - r.last <= staleMs }))
+    .map((r) => {
+      const ageMs = now - r.last;
+      const pidAlive = r.pid ? processAlive(r.pid) : null;
+      let status;
+      if (r.done) status = "done";
+      else if (pidAlive === false) status = "zombie";        // process gone, never finished → orphan
+      else if (ageMs <= staleMs) status = "alive";           // recent heartbeat (pid alive or unknown)
+      else status = "stale";                                  // hung (pid alive, no heartbeat) or unknown+old
+      return { ...r, ageMs, pidAlive, status, alive: status === "alive" };
+    })
     .sort((a, b) => b.last - a.last);
+}
+
+// Rewrite live.jsonl keeping only events whose runId is NOT in `drop` (a Set of runIds). Returns dropped count.
+export function pruneLiveRuns(drop) {
+  if (!drop || !drop.size) return 0;
+  try {
+    const lines = fs.readFileSync(LIVE_FILE, "utf8").split("\n").filter(Boolean);
+    const kept = [];
+    let removed = 0;
+    for (const l of lines) {
+      let ev;
+      try { ev = JSON.parse(l); } catch { kept.push(l); continue; } // keep torn lines verbatim
+      if (ev.runId && drop.has(ev.runId)) removed++;
+      else kept.push(l);
+    }
+    fs.writeFileSync(LIVE_FILE, kept.length ? kept.join("\n") + "\n" : "");
+    return removed;
+  } catch { return 0; }
 }
 
 // Read the most recent `limit` activity records (oldest→newest). Bounded read for the dashboard.

@@ -30,10 +30,11 @@ import readline from "node:readline";
 import crypto from "node:crypto";
 import http from "node:http";
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { loadConfig, clangdIndexUsable, clangdIndexState } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
-import { logActivity, logLive, logFallback, isFailAnswer, liveRuns } from "./activity-log.mjs";
+import { logActivity, logLive, logFallback, isFailAnswer, liveRuns, setLiveExtra, pruneLiveRuns } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
+import { findOrphanVtsProcs, killTree } from "./proc-reap.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -497,19 +498,28 @@ async function defSearch(client, args) {
     return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]${note ? ` ${note}` : ""}:\n` +
       ranked.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
   };
-  // SPLIT-ROOT widen: PROJECT-scoped scan came up empty, but the symbol may be an ENGINE / sibling-package
-  // declaration outside PROJECT. If PROJECT sits under a UE/monorepo cluster root, retry the SAME combined
-  // walk across the whole cluster (which includes Engine/ and sibling packages). runCombined passes an
-  // explicit projectPath, so it searches the wider root directly (no injectProject override). Returns a
-  // formatted answer (noting it was found outside the project) or null if still nothing/timeout.
+  // A "broad" (bare-name) hit that reads `obj.Name(` / `ptr->Name(` is a CALL SITE, not a declaration. For an
+  // ENGINE function the only hits inside the game project ARE call sites — returning one as the "definition" is
+  // wrong AND it suppressed the cluster widen (the scan wasn't empty). Drop call sites so the broad fallback
+  // yields only real decls/defs (`void Name(`, `UClass::Name(`); when that leaves nothing, the widen fires and
+  // finds the real engine declaration. (Identifier names are regex-safe, but escape defensively.)
+  const reSym = sym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const isCallSite = (t) => new RegExp(`(?:\\.|->)\\s*${reSym}\\s*\\(`).test(t);
+  const declOnly = (hits) => hits.filter((h) => !isCallSite(h.text));
+  // SPLIT-ROOT widen: no real declaration under PROJECT, but the symbol may be an ENGINE / sibling-package
+  // declaration outside it. If PROJECT sits under a UE/monorepo cluster root, retry the combined walk across
+  // the whole cluster (Engine/ + sibling packages). SPECIFIC (real-decl) patterns first — a real engine decl
+  // beats a game-side call site — then declOnly(broad). runCombined passes an explicit projectPath, so it
+  // searches the wider root directly (no injectProject override). Returns a formatted answer or null.
   const tryWider = async () => {
     if (!WIDER_ROOT) return null;
-    process.stderr.write(`  · def_search: empty under project → widen to cluster root ${WIDER_ROOT}\n`);
-    let rw = await runCombined(specific, WIDER_ROOT);
-    if (!rw.hits.length && !rw.timeBoxed && broad.length) rw = await runCombined(broad, WIDER_ROOT);
-    if (rw.hits.length) {
-      process.stderr.write(`  · def_search: ${rw.hits.length} hit(s) in cluster root (outside project)\n`);
-      return format(rw.hits, `— in the wider cluster root (outside ${path.basename(PROJECT)}; likely engine/shared)`);
+    process.stderr.write(`  · def_search: no decl under project → widen to cluster root ${WIDER_ROOT}\n`);
+    const rs = await runCombined(specific, WIDER_ROOT);
+    let hits = rs.hits;
+    if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, WIDER_ROOT)).hits);
+    if (hits.length) {
+      process.stderr.write(`  · def_search: ${hits.length} decl(s) in cluster root (outside project)\n`);
+      return format(hits, `— in the wider cluster root (outside ${path.basename(PROJECT)}; likely engine/shared)`);
     }
     return null;
   };
@@ -526,19 +536,20 @@ async function defSearch(client, args) {
       const r2 = await runCombined(specific, src);
       if (r2.hits.length) return format(r2.hits);
       if (r2.timeBoxed) return `inconclusive — def_search(${sym}) scans kept timing out even scoped to ${src}. Narrow further or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat as absent.`;
-      // scoped scan completed empty → fall through to the broad fallback on the scoped root.
-      const rb = await runCombined(broad, src);
-      if (rb.hits.length) return format(rb.hits);
+      // scoped scan completed empty → broad fallback (call sites dropped) on the scoped root.
+      const rb = declOnly((await runCombined(broad, src)).hits);
+      if (rb.length) return format(rb);
       const w1 = await tryWider();
       if (w1) return w1;
       return `no match — def_search(${sym}) found no declaration under ${src} (scoped scan COMPLETE, authoritative)${WIDER_ROOT ? " or in the wider cluster root" : ""}. The name may be spelled differently; try search_text with a fragment or find_files.`;
     }
     return `inconclusive — def_search(${sym}) tree scan timed out and no source root was found to scope to. Pass a narrower projectPath or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat as absent.`;
   }
-  // 3) specific completed empty → last-resort broad (bare-name) pattern, same root.
-  const rb = await runCombined(broad, PROJECT);
-  if (rb.hits.length) return format(rb.hits);
-  // 4) still empty under PROJECT → widen to the cluster root (engine/sibling-package symbol lives outside it).
+  // 3) specific empty → broad (bare-name) fallback, same root, with CALL SITES dropped (so an engine function
+  //    whose only project hits are calls doesn't masquerade as a definition — and the widen below can fire).
+  const rb = declOnly((await runCombined(broad, PROJECT)).hits);
+  if (rb.length) return format(rb);
+  // 4) no real declaration under PROJECT → widen to the cluster root (engine/sibling-package decl lives outside).
   const w = await tryWider();
   if (w) return w;
   return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative)${WIDER_ROOT ? `, including the wider cluster root ${WIDER_ROOT}` : ""}. The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
@@ -1137,22 +1148,50 @@ async function main() {
   // alive). No model, no MCP server. `ping` exits 0 if a run is alive, 1 otherwise (shell-pollable).
   {
     const sub0 = process.argv.slice(2)[0];
-    if (sub0 === "runs" || sub0 === "ping") {
+    if (sub0 === "runs" || sub0 === "ping" || sub0 === "reap") {
       const asJson = process.argv.includes("--json") || /^(1|true|on|yes)$/i.test(process.env.QVTS_JSON || "");
       const staleMs = Number(process.env.QVTS_RUN_STALE_MS || 20000);
       const runs = liveRuns(staleMs);
       const fmt = (r) => `${r.runId.slice(0, 8)} · ${r.lastStep} (${r.steps} tools) · ${Math.round(r.ageMs / 1000)}s ago · "${r.query}"`;
+      const ICON = { alive: "● alive ", done: "○ done  ", zombie: "☠ zombie", stale: "◍ stale " };
       if (sub0 === "ping") {
         const id = process.argv[3];
         const pick = id ? runs.find((r) => r.runId === id || r.runId.startsWith(id)) : (runs.find((r) => r.alive) || runs[0]);
         const alive = !!(pick && pick.alive);
-        if (asJson) process.stdout.write(JSON.stringify(pick ? { runId: pick.runId, alive, ageMs: pick.ageMs, step: pick.lastStep, steps: pick.steps, query: pick.query } : { alive: false, runs: 0 }) + "\n");
-        else process.stdout.write(pick ? `${alive ? "alive" : "stale"} · ${fmt(pick)}\n` : "no runs\n");
+        if (asJson) process.stdout.write(JSON.stringify(pick ? { runId: pick.runId, alive, status: pick.status, ageMs: pick.ageMs, step: pick.lastStep, steps: pick.steps, query: pick.query } : { alive: false, runs: 0 }) + "\n");
+        else process.stdout.write(pick ? `${pick.status} · ${fmt(pick)}\n` : "no runs\n");
         process.exit(alive ? 0 : 1);
       }
-      if (asJson) { process.stdout.write(JSON.stringify({ runs: runs.map((r) => ({ runId: r.runId, alive: r.alive, ageMs: r.ageMs, step: r.lastStep, steps: r.steps, project: r.project, query: r.query })) }) + "\n"); return; }
+      // `qvts reap [--kill]` — clean up after dead sessions. Without --kill: PRUNE finished/zombie log entries
+      // (safe, no processes touched). With --kill: also KILL orphaned vs-search/clangd processes (parent dead)
+      // and SIGKILL hung runs (pid alive but no heartbeat). See proc-reap.mjs for the conservative detection.
+      if (sub0 === "reap") {
+        const doKill = process.argv.includes("--kill");
+        const keepMs = Number(process.env.QVTS_RUN_KEEP_MS || 3600000); // prune done/zombie older than this (1h)
+        const zombies = runs.filter((r) => r.status === "zombie");
+        const stales = runs.filter((r) => r.status === "stale");
+        const drop = new Set(runs.filter((r) => (r.status === "done" || r.status === "zombie") && r.ageMs > keepMs).map((r) => r.runId));
+        const prunedEntries = pruneLiveRuns(drop);
+        const killed = [];
+        if (doKill) {
+          const targets = new Set();
+          for (const r of [...zombies, ...stales]) if (r.server) targets.add(r.server);   // recorded server pids
+          for (const r of stales) if (r.pid && r.pidAlive) targets.add(r.pid);             // hung run processes
+          const { all: orphans } = findOrphanVtsProcs(VTS_SERVER || undefined);            // generic orphan scan
+          for (const p of orphans) targets.add(p.pid);
+          for (const pid of targets) if (killTree(pid)) killed.push(pid);
+        }
+        const summary = { prunedRuns: drop.size, prunedEntries, zombies: zombies.length, stale: stales.length, killed, killedCount: killed.length };
+        if (asJson) { process.stdout.write(JSON.stringify({ reap: summary, kill: doKill }) + "\n"); return; }
+        process.stdout.write(
+          `reap: ${zombies.length} zombie · ${stales.length} stale · pruned ${drop.size} run(s) (${prunedEntries} log lines)` +
+          (doKill ? ` · killed ${killed.length} orphan process(es)${killed.length ? " [" + killed.join(", ") + "]" : ""}` : " · (log only; pass --kill to also stop orphaned vs-search/clangd processes)") + "\n",
+        );
+        return;
+      }
+      if (asJson) { process.stdout.write(JSON.stringify({ runs: runs.map((r) => ({ runId: r.runId, status: r.status, alive: r.alive, ageMs: r.ageMs, step: r.lastStep, steps: r.steps, project: r.project, query: r.query })) }) + "\n"); return; }
       if (!runs.length) { process.stdout.write("no recent qvts runs\n"); return; }
-      for (const r of runs) process.stdout.write(`${r.alive ? "● alive" : "○ done "} ${fmt(r)}\n`);
+      for (const r of runs) process.stdout.write(`${ICON[r.status] || r.status} ${fmt(r)}\n`);
       return;
     }
   }
@@ -1513,7 +1552,18 @@ async function main() {
   // Text-walk budget for search_text/find_files (vs-token-safer's lexical tier). When the LSP tier is
   // fast-failing (unindexed C/C++), text scan is the ONLY working locator — give it a longer budget so a big
   // tree finishes instead of false-negative-aborting at 4s. Normal trees keep 4s. Explicit env always wins.
-  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
+  // DYNAMIC: size the budget to the actual tree. A flat 12s under-serves a giant UE Engine cluster (the walk
+  // aborts mid-tree → false "no match") and over-serves a small repo. dynamicTextTimebox() does a cheap
+  // bounded count (caps at ~40k files / 1.5s) and scales 12s→24s→40s. Size against WIDER_ROOT when a split-root
+  // widen is in play (def_search may scan the whole cluster, not just PROJECT). QVTS_TEXT_TIMEBOX_MS pins it.
+  let TEXT_TIMEBOX;
+  if (process.env.VTS_TEXT_TIMEBOX_MS != null) TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS;
+  else if (process.env.QVTS_TEXT_TIMEBOX_MS) TEXT_TIMEBOX = process.env.QVTS_TEXT_TIMEBOX_MS;
+  else if (FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) {
+    const tb = dynamicTextTimebox(WIDER_ROOT || PROJECT);
+    TEXT_TIMEBOX = String(tb.ms);
+    process.stderr.write(`[vts-local] text-walk budget ${tb.ms}ms for ${(WIDER_ROOT || PROJECT)} (~${tb.count}${tb.capped ? "+" : ""} files${tb.capped ? ", huge" : ""}). Pin with QVTS_TEXT_TIMEBOX_MS.\n`);
+  } else TEXT_TIMEBOX = "4000";
   if (FAST_FAIL) {
     process.stderr.write(
       `[vts-local] unindexed C/C++ — soft fast-fail (per-request ${LSP_TIMEOUT}ms): clangd tools are tried, ` +
@@ -1586,6 +1636,10 @@ async function main() {
   const client = new Client({ name: "vts-local-bridge", version: "0.1.0" }, { capabilities: {} });
   try {
     await client.connect(transport);
+    // Stamp the spawned vs-search server pid into every live event so `qvts reap` can kill THIS run's
+    // orphaned server/clangd if the owning qvts process is later SIGKILLed (the zombie case). Best-effort —
+    // the SDK exposes the child pid as transport.pid (fallback to the internal _process.pid on older SDKs).
+    try { const sp = transport.pid ?? transport._process?.pid; if (sp) setLiveExtra({ server: sp }); } catch { /* optional */ }
   } catch (e) {
     throw new Error(
       `the vs-search server failed to start (${e.message}).\n` +
