@@ -12,7 +12,7 @@ import { ensureDeps } from "./scripts/ensure-deps.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, clangdIndexUsable, clangdIndexState } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
@@ -309,14 +309,21 @@ async function defSearch(client, args, project) {
     return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]${note ? ` ${note}` : ""}:\n` +
       ranked.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
   };
-  // SPLIT-ROOT widen: empty under PROJECT → retry the combined walk across the cluster root (Engine/sibling
-  // packages live outside PROJECT). runCombined passes an explicit projectPath, so it searches the wider root.
+  // A broad (bare-name) hit reading `obj.Name(` / `ptr->Name(` is a CALL SITE, not a declaration. Drop call
+  // sites so an engine function whose only project hits are calls doesn't masquerade as a def — and so the
+  // widen below can fire to find the real engine decl. Mirrors vts-bridge.mjs.
+  const reSym = sym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const isCallSite = (t) => new RegExp(`(?:\\.|->)\\s*${reSym}\\s*\\(`).test(t);
+  const declOnly = (hits) => hits.filter((h) => !isCallSite(h.text));
+  // SPLIT-ROOT widen: no real decl under PROJECT → retry across the cluster root (Engine/sibling packages).
+  // SPECIFIC first (real engine decl beats a game call site), then declOnly(broad). Mirrors vts-bridge.mjs.
   const wider = widenRoot(project);
   const tryWider = async () => {
     if (!wider) return null;
-    let rw = await runCombined(specific, wider);
-    if (!rw.hits.length && !rw.timeBoxed && broad.length) rw = await runCombined(broad, wider);
-    return rw.hits.length ? format(rw.hits, `— in the wider cluster root (outside ${path.basename(project)}; likely engine/shared)`) : null;
+    const rs = await runCombined(specific, wider);
+    let hits = rs.hits;
+    if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, wider)).hits);
+    return hits.length ? format(hits, `— in the wider cluster root (outside ${path.basename(project)}; likely engine/shared)`) : null;
   };
   let r = await runCombined(specific, project);
   if (r.hits.length) return format(r.hits);
@@ -326,16 +333,16 @@ async function defSearch(client, args, project) {
       const r2 = await runCombined(specific, src);
       if (r2.hits.length) return format(r2.hits);
       if (r2.timeBoxed) return `inconclusive — def_search(${sym}) scans timed out even scoped to ${src}; narrow further or raise QVTS_TEXT_TIMEBOX_MS (do NOT treat as absent).`;
-      const rb2 = await runCombined(broad, src);
-      if (rb2.hits.length) return format(rb2.hits);
+      const rb2 = declOnly((await runCombined(broad, src)).hits);
+      if (rb2.length) return format(rb2);
       const w1 = await tryWider();
       if (w1) return w1;
       return `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, authoritative)${wider ? " or in the wider cluster root" : ""}.`;
     }
     return `inconclusive — def_search(${sym}) tree scan timed out; pass a narrower projectPath (do NOT treat as absent).`;
   }
-  const rb = await runCombined(broad, project);
-  if (rb.hits.length) return format(rb.hits);
+  const rb = declOnly((await runCombined(broad, project)).hits);
+  if (rb.length) return format(rb);
   const w = await tryWider();
   if (w) return w;
   return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative)${wider ? `, including the wider cluster root ${wider}` : ""}.`;
@@ -420,8 +427,14 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (LSP_VERDICT.suggestedTimeoutMs ? String(LSP_VERDICT.suggestedTimeoutMs) : ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000"));
   const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? ((FAST_FAIL || CIRCUIT_OPEN || NO_INDEX) ? "2000" : "15000");
   // Text-walk budget (search_text/find_files). Longer when the LSP tier is fast-failing (unindexed C/C++) so a
-  // giant tree's text scan finishes instead of false-negative-aborting at vs-token-safer's 4s default.
-  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? ((FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
+  // giant tree's text scan finishes instead of false-negative-aborting at vs-token-safer's 4s default. DYNAMIC:
+  // size to the tree (cheap bounded count, 12s→24s→40s); size against the split-root cluster (widenRoot) since
+  // def_search may scan the whole cluster. Explicit VTS_/QVTS_TEXT_TIMEBOX_MS pins it. Mirrors vts-bridge.mjs.
+  let TEXT_TIMEBOX;
+  if (process.env.VTS_TEXT_TIMEBOX_MS != null) TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS;
+  else if (process.env.QVTS_TEXT_TIMEBOX_MS) TEXT_TIMEBOX = process.env.QVTS_TEXT_TIMEBOX_MS;
+  else if (FAST_FAIL || NO_INDEX || CIRCUIT_OPEN) TEXT_TIMEBOX = String(dynamicTextTimebox(widenRoot(project) || project).ms);
+  else TEXT_TIMEBOX = "4000";
   const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
   let requested;
   if (toolsSpec) {

@@ -139,6 +139,47 @@ export function clangdIndexUsable(project) {
   return false; // C/C++ with an unreadable/huge DB → narrow to be safe
 }
 
+// ---- tree-size estimate → dynamic text-walk budget -----------------------------------------------
+// On an UNINDEXED tree the lexical search_text walk is the only working locator, and its time-box must be big
+// enough to actually finish — but a flat 12s under-serves a giant UE Engine cluster (the walk aborts mid-tree
+// → false "no match") while over-serving a small repo. So MEASURE the tree cheaply and scale the box. The
+// count is BOUNDED: it stops at `cap` files OR `budgetMs` elapsed, whichever first — so even a 500k-file
+// Engine costs ~budgetMs, not a full walk. Hitting the cap/budget IS the "this tree is huge" signal.
+const TREE_SKIP = new Set([
+  "node_modules", ".git", "build", "dist", "out", "obj", "bin", "target", ".next", ".cache",
+  "coverage", "vendor", "Intermediate", "Binaries", "Saved", "DerivedDataCache", ".vts-index", ".vs",
+]);
+export function treeFileCount(root, { cap = 40000, budgetMs = 1500 } = {}) {
+  if (!root) return { count: 0, capped: false };
+  const start = Date.now();
+  let count = 0;
+  const stack = [root];
+  while (stack.length) {
+    if (count >= cap || Date.now() - start > budgetMs) return { count, capped: true };
+    const d = stack.pop();
+    let ents;
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      if (e.isDirectory()) {
+        if (!TREE_SKIP.has(e.name) && !e.name.startsWith(".")) stack.push(path.join(d, e.name));
+      } else if (e.isFile()) {
+        if (++count >= cap) return { count, capped: true };
+      }
+    }
+  }
+  return { count, capped: false };
+}
+// Pick a text-walk time-box (ms) sized to the tree under `root`. floorMs is the unindexed default (the proven
+// 12s); a bigger tree scales up to QVTS_TEXT_TIMEBOX_MAX_MS (default 40s). Returns { ms, count, capped } so the
+// caller can log WHY it chose that budget. Only meaningful in the unindexed/fast-fail path (indexed trees use 4s).
+export function dynamicTextTimebox(root, { floorMs = 12000 } = {}) {
+  const max = Number(process.env.QVTS_TEXT_TIMEBOX_MAX_MS || 40000);
+  const { count, capped } = treeFileCount(root);
+  let ms = capped ? max : count >= 15000 ? 24000 : floorMs; // huge → max; large → 24s; else floor 12s
+  ms = Math.min(Math.max(ms, floorMs), max);
+  return { ms, count, capped };
+}
+
 export function loadConfig() {
   const f = fromFile();
   const e = process.env;
