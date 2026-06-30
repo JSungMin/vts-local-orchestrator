@@ -478,13 +478,17 @@ async function defSearch(client, args) {
     }
     return hits;
   };
-  // Run a set of patterns as ONE combined alternation walk. Returns { hits, timeBoxed, errored }.
-  const runCombined = async (patterns, root) => {
+  // Run a set of patterns as ONE combined alternation walk. Returns { hits, timeBoxed, errored }. An optional
+  // `glob` narrows the walk by extension — used by the cluster WIDEN to scan only headers, so a giant engine
+  // tree doesn't make vs-token-safer's server walk every file and CRASH ("MCP Connection closed").
+  const runCombined = async (patterns, root, glob) => {
     if (!patterns.length) return { hits: [], timeBoxed: false, errored: false };
     const q = patterns.map((c) => `(?:${c.q})`).join("|");
+    const callArgs = { q, projectPath: root };
+    if (glob) callArgs.glob = glob;
     let out;
     try {
-      const r = await client.callTool({ name: "search_text", arguments: { q, projectPath: root } });
+      const r = await client.callTool({ name: "search_text", arguments: callArgs });
       out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
       if (r.isError) return { hits: [], timeBoxed: false, errored: true };
     } catch (e) {
@@ -492,6 +496,10 @@ async function defSearch(client, args) {
     }
     return { hits: parseHits(out), timeBoxed: TIME_BOXED.test(out) };
   };
+  // Declarations live in headers for C/C++ — globbing the widen to *.h shrinks a giant Engine walk by ~10x and
+  // keeps the vs-search server from crashing on the cluster scan. Other languages keep decl+impl in one file,
+  // so no header glob helps there (null = walk all). Override/disable with QVTS_WIDEN_GLOB ("" to force none).
+  const WIDEN_GLOB = process.env.QVTS_WIDEN_GLOB ?? ((lang === "cpp" || lang === "c") ? "*.h" : null);
   const format = (hits, note) => {
     const ranked = rankHits(hits).slice(0, 8);
     const kinds = [...new Set(ranked.map((h) => h.kind))].join(", ");
@@ -513,10 +521,10 @@ async function defSearch(client, args) {
   // searches the wider root directly (no injectProject override). Returns a formatted answer or null.
   const tryWider = async () => {
     if (!WIDER_ROOT) return null;
-    process.stderr.write(`  · def_search: no decl under project → widen to cluster root ${WIDER_ROOT}\n`);
-    const rs = await runCombined(specific, WIDER_ROOT);
+    process.stderr.write(`  · def_search: no decl under project → widen to cluster root ${WIDER_ROOT}${WIDEN_GLOB ? ` (glob ${WIDEN_GLOB})` : ""}\n`);
+    const rs = await runCombined(specific, WIDER_ROOT, WIDEN_GLOB);
     let hits = rs.hits;
-    if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, WIDER_ROOT)).hits);
+    if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, WIDER_ROOT, WIDEN_GLOB)).hits);
     if (hits.length) {
       process.stderr.write(`  · def_search: ${hits.length} decl(s) in cluster root (outside project)\n`);
       return format(hits, `— in the wider cluster root (outside ${path.basename(PROJECT)}; likely engine/shared)`);
@@ -1162,11 +1170,17 @@ async function main() {
         else process.stdout.write(pick ? `${pick.status} · ${fmt(pick)}\n` : "no runs\n");
         process.exit(alive ? 0 : 1);
       }
-      // `qvts reap [--kill]` — clean up after dead sessions. Without --kill: PRUNE finished/zombie log entries
-      // (safe, no processes touched). With --kill: also KILL orphaned vs-search/clangd processes (parent dead)
-      // and SIGKILL hung runs (pid alive but no heartbeat). See proc-reap.mjs for the conservative detection.
+      // `qvts reap [--kill] [--kill-hung]` — clean up after dead sessions. Without --kill: PRUNE finished/zombie
+      // log entries (safe, no processes touched). With --kill: stop ORPHANED vs-search/clangd — but ONLY
+      // processes whose PARENT is dead. That distinction is the whole safety story: a slow-but-WORKING locate on
+      // a giant tree goes >staleMs between heartbeats and looks "stale", yet its parent (the session's qvts) is
+      // alive — so it must NEVER be killed. (An earlier version killed any alive "stale" run; on a huge cluster
+      // scan that wrongly SIGKILLed in-flight searches → "MCP Connection closed". Don't reintroduce that.)
+      // --kill-hung is the explicit, dangerous opt-in for an alive-but-silent run past QVTS_HUNG_MS (default 10m).
       if (sub0 === "reap") {
         const doKill = process.argv.includes("--kill");
+        const killHung = process.argv.includes("--kill-hung");
+        const hungMs = Number(process.env.QVTS_HUNG_MS || 600000); // 10min: an alive run silent this long = wedged
         const keepMs = Number(process.env.QVTS_RUN_KEEP_MS || 3600000); // prune done/zombie older than this (1h)
         const zombies = runs.filter((r) => r.status === "zombie");
         const stales = runs.filter((r) => r.status === "stale");
@@ -1175,17 +1189,22 @@ async function main() {
         const killed = [];
         if (doKill) {
           const targets = new Set();
-          for (const r of [...zombies, ...stales]) if (r.server) targets.add(r.server);   // recorded server pids
-          for (const r of stales) if (r.pid && r.pidAlive) targets.add(r.pid);             // hung run processes
-          const { all: orphans } = findOrphanVtsProcs(VTS_SERVER || undefined);            // generic orphan scan
+          // SAFE: a zombie run's owning qvts is CONFIRMED dead → its recorded server is orphaned.
+          for (const r of zombies) if (r.server) targets.add(r.server);
+          // SAFE: orphan scan returns only processes whose PARENT is dead (a live session's server is excluded).
+          const { all: orphans } = findOrphanVtsProcs(VTS_SERVER || undefined);
           for (const p of orphans) targets.add(p.pid);
+          // OPT-IN ONLY: an alive-but-silent run past the (long) hung threshold — likely wedged, not just slow.
+          if (killHung) for (const r of stales) if (r.pid && r.pidAlive && r.ageMs > hungMs) { targets.add(r.pid); if (r.server) targets.add(r.server); }
           for (const pid of targets) if (killTree(pid)) killed.push(pid);
         }
         const summary = { prunedRuns: drop.size, prunedEntries, zombies: zombies.length, stale: stales.length, killed, killedCount: killed.length };
-        if (asJson) { process.stdout.write(JSON.stringify({ reap: summary, kill: doKill }) + "\n"); return; }
+        if (asJson) { process.stdout.write(JSON.stringify({ reap: summary, kill: doKill, killHung }) + "\n"); return; }
         process.stdout.write(
           `reap: ${zombies.length} zombie · ${stales.length} stale · pruned ${drop.size} run(s) (${prunedEntries} log lines)` +
-          (doKill ? ` · killed ${killed.length} orphan process(es)${killed.length ? " [" + killed.join(", ") + "]" : ""}` : " · (log only; pass --kill to also stop orphaned vs-search/clangd processes)") + "\n",
+          (doKill
+            ? ` · killed ${killed.length} orphan process(es)${killed.length ? " [" + killed.join(", ") + "]" : ""}${stales.length && !killHung ? ` · ${stales.length} stale run(s) LEFT ALONE (may be slow, not hung; --kill-hung to force after ${Math.round(hungMs / 60000)}m)` : ""}`
+            : " · (log only; --kill stops PARENT-DEAD orphan processes; slow live runs are never touched)") + "\n",
         );
         return;
       }

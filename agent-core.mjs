@@ -292,17 +292,22 @@ async function defSearch(client, args, project) {
     }
     return hits;
   };
-  const runCombined = async (patterns, root) => {
+  // Optional `glob` narrows the walk by extension — the cluster WIDEN uses it to scan only headers so a giant
+  // engine tree doesn't make the vs-search server walk every file and crash. Mirrors vts-bridge.mjs.
+  const runCombined = async (patterns, root, glob) => {
     if (!patterns.length) return { hits: [], timeBoxed: false };
     const q = patterns.map((c) => `(?:${c.q})`).join("|");
+    const callArgs = { q, projectPath: root };
+    if (glob) callArgs.glob = glob;
     let out;
     try {
-      const r = await client.callTool({ name: "search_text", arguments: { q, projectPath: root } });
+      const r = await client.callTool({ name: "search_text", arguments: callArgs });
       out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
       if (r.isError) return { hits: [], timeBoxed: false };
     } catch { return { hits: [], timeBoxed: false }; }
     return { hits: parseHits(out), timeBoxed: TIME_BOXED.test(out) };
   };
+  const WIDEN_GLOB = process.env.QVTS_WIDEN_GLOB ?? ((lang === "cpp" || lang === "c") ? "*.h" : null);
   const format = (hits, note) => {
     const ranked = rankHits(hits).slice(0, 8);
     const kinds = [...new Set(ranked.map((h) => h.kind))].join(", ");
@@ -320,9 +325,9 @@ async function defSearch(client, args, project) {
   const wider = widenRoot(project);
   const tryWider = async () => {
     if (!wider) return null;
-    const rs = await runCombined(specific, wider);
+    const rs = await runCombined(specific, wider, WIDEN_GLOB);
     let hits = rs.hits;
-    if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, wider)).hits);
+    if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, wider, WIDEN_GLOB)).hits);
     return hits.length ? format(hits, `— in the wider cluster root (outside ${path.basename(project)}; likely engine/shared)`) : null;
   };
   let r = await runCombined(specific, project);
