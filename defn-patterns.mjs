@@ -75,6 +75,12 @@ export function definitionSearches(name, lang) {
       add(`(class|struct)\\s+([A-Za-z_][A-Za-z0-9_]*\\s+)?${P}\\b`, "type", true); // incl. MODULE_API macro
       add(`enum\\s+(class\\s+)?${P}\\b`, "enum", true);
       add(`(typedef|using)\\b.*\\b${N}\\b`, "alias", true);
+      // MEMBER VARIABLE / field: `[UPROPERTY(...)] <Type> Name [= init];` at class scope. The type must look
+      // like a type — a known primitive, a PascalCase/UE type (FVector, UClass, TArray<…>), or a pointer/ref —
+      // so a usage statement (`return Significance;`) isn't matched. Name must be FOLLOWED by [=;[] (not `(`,
+      // which would be a function). Covers the common "where is the uint8 Foo member declared" hunt that the
+      // type/enum/function patterns all miss. headerish: members are declared in the header.
+      add(`^\\s*(UPROPERTY\\s*\\([^)]*\\)\\s*)?(uint8|uint16|uint32|uint64|int8|int16|int32|int64|int|float|double|bool|FString|FName|FText|[A-Z]\\w+(<[^>]*>)?|[A-Za-z_]\\w*\\s*[*&])\\s+\\*?&?${N}\\s*(\\[[^\\]]*\\])?\\s*(=[^;]*)?;`, "field", true);
       add(`\\b${N}\\s*\\([^;{]*\\)\\s*(const)?\\s*\\{`, "function-def", false); // body, not a prototype
       add(`\\b${N}\\s*\\(`, "function-decl", false);
       break;
