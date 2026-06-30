@@ -43,13 +43,38 @@ const NUM_CTX = CFG.numCtx;
 const KEEP_ALIVE = process.env.QVTS_KEEP_ALIVE || "30m"; // keep the model resident between calls (perf)
 
 // ---- resolve the target project root (so we can inject it into tool args Qwen forgets) ----
+// `-p` / `--project` from argv. The SKILL + route-steer tell the agent to pass `qvts -p "<repo>"`, but the
+// npm-global `qvts` shim forwards EVERY arg straight to this bridge (it doesn't translate -p → VTS_PROJECT
+// the way qvts.sh/qvts.ps1 do), so without parsing it here the flag is silently swallowed and PROJECT falls
+// back to the config root — a delegated locate then searches the WRONG repo. Parse it at the source of truth
+// so it works through any launcher (shim, direct `node vts-bridge.mjs`, qvts.sh — env still wins for daemon).
+function projectFromArgv(a = process.argv) {
+  for (let i = 2; i < a.length; i++) {
+    if ((a[i] === "-p" || a[i] === "--project") && a[i + 1]) return a[i + 1];
+    if (a[i].startsWith("--project=")) return a[i].slice("--project=".length);
+  }
+  return null;
+}
+// Remove `-p VALUE` / `--project VALUE` / `--project=VALUE` from a token list so they don't pollute the
+// natural-language locate task (`qvts -p X "find Foo"` must run the query "find Foo", not "-p X find Foo").
+function stripProjectArgs(arr) {
+  const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] === "-p" || arr[i] === "--project") { i++; continue; } // skip flag + its value
+    if (arr[i].startsWith("--project=")) continue;
+    out.push(arr[i]);
+  }
+  return out;
+}
 function readProjectPath() {
-  if (process.env.VTS_PROJECT) return process.env.VTS_PROJECT;
+  const fromArg = projectFromArgv();        // explicit -p wins for a one-shot…
+  if (fromArg) return fromArg;
+  if (process.env.VTS_PROJECT) return process.env.VTS_PROJECT; // …else env (set by qvts.sh/.ps1 + daemon)…
   try {
     const cfg = JSON.parse(
       fs.readFileSync(path.join(os.homedir(), ".vs-token-safer", "config.json"), "utf8"),
     );
-    return cfg.projectPath || null;
+    return cfg.projectPath || null;          // …else the configured default root.
   } catch {
     return null;
   }
@@ -1243,7 +1268,7 @@ async function main() {
         return;
       }
     } else if (st) {
-      const oneShotEarly = rawArgs.filter((a) => !["--json", "--no-cache", "--no-daemon", "--savings"].includes(a)).join(" ").trim();
+      const oneShotEarly = stripProjectArgs(rawArgs.filter((a) => !["--json", "--no-cache", "--no-daemon", "--savings"].includes(a))).join(" ").trim();
       if (oneShotEarly) {
         const r = await httpJson("POST", st.port, "/locate", { query: oneShotEarly, noCache });
         if (r.status === 200 && r.json) {
@@ -1574,7 +1599,7 @@ async function main() {
   }
 
   const FLAGS = new Set(["--json", "--savings", "--no-cache"]);
-  const argv = process.argv.slice(2).filter((a) => !FLAGS.has(a));
+  const argv = stripProjectArgs(process.argv.slice(2).filter((a) => !FLAGS.has(a)));
   if (process.argv.includes("--json")) process.env.QVTS_JSON = "1";
   const oneShot = argv.join(" ").trim();
 
