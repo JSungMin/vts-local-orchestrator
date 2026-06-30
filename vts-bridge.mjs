@@ -82,6 +82,44 @@ function readProjectPath() {
 }
 const PROJECT = readProjectPath();
 
+// ---- split-root / cluster widening ----------------------------------------------------------------
+// A delegated locate is scoped to PROJECT (often the GAME/package sub-folder, picked by -p or active-project
+// tracking — narrow on purpose, for speed). But an ENGINE / cross-package symbol lives in a SIBLING tree
+// under a shared parent: Unreal `<root>/{Engine, MyGame}`, or a monorepo `<root>/{pkgA, pkgB}`. A
+// PROJECT-scoped scan never reaches that sibling, so an engine-level symbol (a type/variable declared in the
+// Engine/ tree, not the game) reads as a FALSE "no match". widenRoot(PROJECT) returns the cluster root so a
+// dry narrow scan can retry across the whole cluster. The heuristic is SPECIFIC (a real Engine sibling, or a
+// recognized workspace-root marker) so it never climbs into an umbrella folder that merely holds unrelated
+// repos (e.g. a notes vault). Disable with QVTS_WIDEN=0.
+function isUnrealRoot(dir) {
+  try {
+    const eng = fs.readdirSync(dir, { withFileTypes: true }).find((e) => e.isDirectory() && /^engine$/i.test(e.name));
+    if (!eng) return false;
+    const ep = path.join(dir, eng.name);
+    return ["Source", "Build", "Binaries"].some((s) => { try { return fs.statSync(path.join(ep, s)).isDirectory(); } catch { return false; } });
+  } catch { return false; }
+}
+function isWorkspaceRoot(dir) {
+  for (const f of ["pnpm-workspace.yaml", "lerna.json", "go.work", "nx.json", "turbo.json", "rush.json"]) {
+    try { if (fs.statSync(path.join(dir, f)).isFile()) return true; } catch { /* none */ }
+  }
+  try { if (JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).workspaces) return true; } catch { /* none */ }
+  try { if (/^\s*\[workspace\]/m.test(fs.readFileSync(path.join(dir, "Cargo.toml"), "utf8"))) return true; } catch { /* none */ }
+  return false;
+}
+function widenRoot(project) {
+  if (!project || /^(0|false|off|no)$/i.test(process.env.QVTS_WIDEN || "")) return null;
+  let cur = path.resolve(project);
+  for (let i = 0; i < 2; i++) { // immediate parent + grandparent only — never walk to the fs/umbrella root
+    const parent = path.dirname(cur);
+    if (!parent || parent === cur) break;
+    if (isUnrealRoot(parent) || isWorkspaceRoot(parent)) return parent;
+    cur = parent;
+  }
+  return null;
+}
+const WIDER_ROOT = widenRoot(PROJECT);
+
 // Shrink the final answer's token cost: strip the (long, absolute) project-root prefix so cited paths
 // are repo-relative (search_symbol/goto return absolute paths; find_files/find_references return relative).
 // PROJECT reflects the -p / VTS_PROJECT target. No-op when PROJECT is unset.
@@ -453,11 +491,27 @@ async function defSearch(client, args) {
     }
     return { hits: parseHits(out), timeBoxed: TIME_BOXED.test(out) };
   };
-  const format = (hits) => {
+  const format = (hits, note) => {
     const ranked = rankHits(hits).slice(0, 8);
     const kinds = [...new Set(ranked.map((h) => h.kind))].join(", ");
-    return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]:\n` +
+    return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]${note ? ` ${note}` : ""}:\n` +
       ranked.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
+  };
+  // SPLIT-ROOT widen: PROJECT-scoped scan came up empty, but the symbol may be an ENGINE / sibling-package
+  // declaration outside PROJECT. If PROJECT sits under a UE/monorepo cluster root, retry the SAME combined
+  // walk across the whole cluster (which includes Engine/ and sibling packages). runCombined passes an
+  // explicit projectPath, so it searches the wider root directly (no injectProject override). Returns a
+  // formatted answer (noting it was found outside the project) or null if still nothing/timeout.
+  const tryWider = async () => {
+    if (!WIDER_ROOT) return null;
+    process.stderr.write(`  · def_search: empty under project → widen to cluster root ${WIDER_ROOT}\n`);
+    let rw = await runCombined(specific, WIDER_ROOT);
+    if (!rw.hits.length && !rw.timeBoxed && broad.length) rw = await runCombined(broad, WIDER_ROOT);
+    if (rw.hits.length) {
+      process.stderr.write(`  · def_search: ${rw.hits.length} hit(s) in cluster root (outside project)\n`);
+      return format(rw.hits, `— in the wider cluster root (outside ${path.basename(PROJECT)}; likely engine/shared)`);
+    }
+    return null;
   };
 
   // 1) specific patterns, combined, on the whole tree.
@@ -475,14 +529,19 @@ async function defSearch(client, args) {
       // scoped scan completed empty → fall through to the broad fallback on the scoped root.
       const rb = await runCombined(broad, src);
       if (rb.hits.length) return format(rb.hits);
-      return `no match — def_search(${sym}) found no declaration under ${src} (scoped scan COMPLETE, authoritative). The name may be spelled differently; try search_text with a fragment or find_files.`;
+      const w1 = await tryWider();
+      if (w1) return w1;
+      return `no match — def_search(${sym}) found no declaration under ${src} (scoped scan COMPLETE, authoritative)${WIDER_ROOT ? " or in the wider cluster root" : ""}. The name may be spelled differently; try search_text with a fragment or find_files.`;
     }
     return `inconclusive — def_search(${sym}) tree scan timed out and no source root was found to scope to. Pass a narrower projectPath or raise QVTS_TEXT_TIMEBOX_MS; do NOT treat as absent.`;
   }
   // 3) specific completed empty → last-resort broad (bare-name) pattern, same root.
   const rb = await runCombined(broad, PROJECT);
   if (rb.hits.length) return format(rb.hits);
-  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative). The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
+  // 4) still empty under PROJECT → widen to the cluster root (engine/sibling-package symbol lives outside it).
+  const w = await tryWider();
+  if (w) return w;
+  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative)${WIDER_ROOT ? `, including the wider cluster root ${WIDER_ROOT}` : ""}. The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
 }
 
 // Extract balanced {...} / [...] JSON blobs embedded in free text (one level of nesting tracking).

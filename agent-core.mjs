@@ -216,6 +216,38 @@ const isEmptyResult = (r) => {
   );
 };
 
+// Split-root / cluster widening — a PROJECT-scoped scan misses an ENGINE/sibling-package declaration that
+// lives outside PROJECT (UE `<root>/{Engine, Game}`, monorepo `<root>/{pkgA, pkgB}`). widenRoot returns the
+// cluster root so a dry scan can retry across it. Specific heuristic (real Engine sibling / workspace marker)
+// so it never climbs into an umbrella folder of unrelated repos. Mirrors vts-bridge.mjs. Disable: QVTS_WIDEN=0.
+function isUnrealRoot(dir) {
+  try {
+    const eng = fs.readdirSync(dir, { withFileTypes: true }).find((e) => e.isDirectory() && /^engine$/i.test(e.name));
+    if (!eng) return false;
+    const ep = path.join(dir, eng.name);
+    return ["Source", "Build", "Binaries"].some((s) => { try { return fs.statSync(path.join(ep, s)).isDirectory(); } catch { return false; } });
+  } catch { return false; }
+}
+function isWorkspaceRoot(dir) {
+  for (const f of ["pnpm-workspace.yaml", "lerna.json", "go.work", "nx.json", "turbo.json", "rush.json"]) {
+    try { if (fs.statSync(path.join(dir, f)).isFile()) return true; } catch { /* none */ }
+  }
+  try { if (JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).workspaces) return true; } catch { /* none */ }
+  try { if (/^\s*\[workspace\]/m.test(fs.readFileSync(path.join(dir, "Cargo.toml"), "utf8"))) return true; } catch { /* none */ }
+  return false;
+}
+function widenRoot(project) {
+  if (!project || /^(0|false|off|no)$/i.test(process.env.QVTS_WIDEN || "")) return null;
+  let cur = path.resolve(project);
+  for (let i = 0; i < 2; i++) { // immediate parent + grandparent only — never walk to the fs/umbrella root
+    const parent = path.dirname(cur);
+    if (!parent || parent === cur) break;
+    if (isUnrealRoot(parent) || isWorkspaceRoot(parent)) return parent;
+    cur = parent;
+  }
+  return null;
+}
+
 // def_search — synthetic deterministic declaration locator over search_text (see vts-bridge.mjs). Tries the
 // language's definition regexes in priority order and returns the first that matches.
 const TIME_BOXED = /time-box hit|time-boxed|NOT conclusive|INCONCLUSIVE/i;
@@ -271,11 +303,20 @@ async function defSearch(client, args, project) {
     } catch { return { hits: [], timeBoxed: false }; }
     return { hits: parseHits(out), timeBoxed: TIME_BOXED.test(out) };
   };
-  const format = (hits) => {
+  const format = (hits, note) => {
     const ranked = rankHits(hits).slice(0, 8);
     const kinds = [...new Set(ranked.map((h) => h.kind))].join(", ");
-    return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]:\n` +
+    return `def_search(${sym}, lang=${lang || "auto"}) — ${ranked.length} decl candidate(s) [${kinds}]${note ? ` ${note}` : ""}:\n` +
       ranked.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
+  };
+  // SPLIT-ROOT widen: empty under PROJECT → retry the combined walk across the cluster root (Engine/sibling
+  // packages live outside PROJECT). runCombined passes an explicit projectPath, so it searches the wider root.
+  const wider = widenRoot(project);
+  const tryWider = async () => {
+    if (!wider) return null;
+    let rw = await runCombined(specific, wider);
+    if (!rw.hits.length && !rw.timeBoxed && broad.length) rw = await runCombined(broad, wider);
+    return rw.hits.length ? format(rw.hits, `— in the wider cluster root (outside ${path.basename(project)}; likely engine/shared)`) : null;
   };
   let r = await runCombined(specific, project);
   if (r.hits.length) return format(r.hits);
@@ -287,13 +328,17 @@ async function defSearch(client, args, project) {
       if (r2.timeBoxed) return `inconclusive — def_search(${sym}) scans timed out even scoped to ${src}; narrow further or raise QVTS_TEXT_TIMEBOX_MS (do NOT treat as absent).`;
       const rb2 = await runCombined(broad, src);
       if (rb2.hits.length) return format(rb2.hits);
-      return `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, authoritative).`;
+      const w1 = await tryWider();
+      if (w1) return w1;
+      return `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, authoritative)${wider ? " or in the wider cluster root" : ""}.`;
     }
     return `inconclusive — def_search(${sym}) tree scan timed out; pass a narrower projectPath (do NOT treat as absent).`;
   }
   const rb = await runCombined(broad, project);
   if (rb.hits.length) return format(rb.hits);
-  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative).`;
+  const w = await tryWider();
+  if (w) return w;
+  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative)${wider ? `, including the wider cluster root ${wider}` : ""}.`;
 }
 
 // Streamed /api/chat. Calls onDelta(text) per token chunk; resolves with the assembled message + timing.
