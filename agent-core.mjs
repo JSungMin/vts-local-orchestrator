@@ -218,25 +218,58 @@ const isEmptyResult = (r) => {
 // def_search — synthetic deterministic declaration locator over search_text (see vts-bridge.mjs). Tries the
 // language's definition regexes in priority order and returns the first that matches.
 const DEF_EMPTY = /\bno (text |symbol )?match|\bnot found\b|\(0\)/i;
+const TIME_BOXED = /time-box hit|time-boxed|NOT conclusive|INCONCLUSIVE/i;
+// Strip search_text's model-facing chrome (steer / completeness cert / log hint / savings line) — inside
+// def_search it's pure context waste; we want just the declaration hits. Mirrors vts-bridge.mjs.
+function stripVtsChrome(text) {
+  return String(text)
+    .split("\n")
+    .filter((l) => !/^↪ /.test(l) && !/^\[completeness:/.test(l) && !/Looking for something in a LOG\?/.test(l) && !/^✓ Saved/.test(l))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 async function defSearch(client, args, project) {
   const sym = String(args.name || args.symbol || args.q || "").trim();
   if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
   const lang = (args.lang && String(args.lang).toLowerCase()) || detectLang(project) || "";
   const cands = definitionSearches(sym, lang || undefined).slice(0, 6);
-  for (const c of cands) {
-    let out;
-    try {
-      const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: project } });
-      out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
-      if (r.isError) out = `TOOL ERROR:\n${out}`;
-    } catch (e) {
-      out = `TOOL EXCEPTION: ${e.message}`;
+  const sourceRoot = () => {
+    for (const d of ["Source", "source", "src"]) {
+      try { const p = path.join(project, d); if (fs.statSync(p).isDirectory()) return p; } catch { /* none */ }
     }
-    if (!DEF_EMPTY.test(out) && !/^TOOL E/.test(out)) {
-      return `def_search(${sym}, lang=${lang || "auto"}) — definition pattern /${c.q}/ [${c.kind}]:\n${out}`;
+    return null;
+  };
+  const runPatterns = async (root) => {
+    let anyTimeBox = false;
+    for (const c of cands) {
+      let out;
+      try {
+        const r = await client.callTool({ name: "search_text", arguments: { q: c.q, projectPath: root } });
+        out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
+        if (r.isError) out = `TOOL ERROR:\n${out}`;
+      } catch (e) {
+        out = `TOOL EXCEPTION: ${e.message}`;
+      }
+      if (TIME_BOXED.test(out)) anyTimeBox = true;
+      if (!DEF_EMPTY.test(out) && !/^TOOL E/.test(out)) {
+        return { hit: true, body: `def_search(${sym}, lang=${lang || "auto"}) [${c.kind}]:\n${stripVtsChrome(out)}` };
+      }
     }
+    return { hit: false, anyTimeBox };
+  };
+  const res = await runPatterns(project);
+  if (res.hit) return res.body;
+  const src = res.anyTimeBox ? sourceRoot() : null;
+  if (src) {
+    const res2 = await runPatterns(src);
+    if (res2.hit) return res2.body;
+    return res2.anyTimeBox
+      ? `inconclusive — def_search(${sym}) scans timed out even scoped to ${src}; narrow further or raise QVTS_TEXT_TIMEBOX_MS (do NOT treat as absent).`
+      : `no match — def_search(${sym}) found nothing under ${src} (scoped scan COMPLETE, authoritative).`;
   }
-  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"}; none matched.`;
+  if (res.anyTimeBox) return `inconclusive — def_search(${sym}) tree scan timed out; pass a narrower projectPath (do NOT treat as absent).`;
+  return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative).`;
 }
 
 // Streamed /api/chat. Calls onDelta(text) per token chunk; resolves with the assembled message + timing.
@@ -309,6 +342,9 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const FAST_FAIL = !INDEX_USABLE && !NARROW_OFF && !NARROW_HARD;
   const LSP_TIMEOUT = process.env.VTS_LSP_TIMEOUT_MS ?? (FAST_FAIL ? (process.env.QVTS_FASTFAIL_TIMEOUT_MS || "4000") : "30000");
   const LSP_INDEX_WAIT = process.env.VTS_LSP_INDEX_WAIT_MS ?? (FAST_FAIL ? "2000" : "15000");
+  // Text-walk budget (search_text/find_files). Longer when the LSP tier is fast-failing (unindexed C/C++) so a
+  // giant tree's text scan finishes instead of false-negative-aborting at vs-token-safer's 4s default.
+  const TEXT_TIMEBOX = process.env.VTS_TEXT_TIMEBOX_MS ?? (FAST_FAIL ? (process.env.QVTS_TEXT_TIMEBOX_MS || "12000") : "4000");
   const toolsSpec = process.env.QVTS_TOOLS || CFG.tools;
   let requested;
   if (toolsSpec) {
@@ -328,7 +364,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [VTS_SERVER],
-    env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0", VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0", VTS_LSP_INDEX_WAIT_MS: LSP_INDEX_WAIT, VTS_LSP_TIMEOUT_MS: LSP_TIMEOUT },
+    env: { ...process.env, VTS_PREWARM: process.env.VTS_PREWARM ?? "0", VTS_AUTO_LEARN: process.env.VTS_AUTO_LEARN ?? "0", VTS_CLANGD_BG_INDEX: process.env.VTS_CLANGD_BG_INDEX ?? "0", VTS_LSP_INDEX_WAIT_MS: LSP_INDEX_WAIT, VTS_LSP_TIMEOUT_MS: LSP_TIMEOUT, VTS_TEXT_TIMEBOX_MS: TEXT_TIMEBOX },
     stderr: "ignore",
   });
   const client = new Client({ name: "vts-local-dashboard", version: "0.1.0" }, { capabilities: {} });
