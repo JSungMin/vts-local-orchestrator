@@ -93,6 +93,20 @@ export function clangdIndexState(project) {
   return "toobig";
 }
 
+// vs-token-safer's `vts index` builds a committable TREE-SITTER symbol index (.vts-index/symbols.jsonl) that
+// answers search_symbol / document_symbols INSTANTLY with no clangd compile — the "syntactic tier". On a giant
+// unindexed C/C++ tree (clangd bg-index OFF above the TU threshold) this is the cheap way to get real symbol
+// search. So even when the compile DB says "none"/"toobig", if a syntactic index exists the symbol tools DO
+// work and must NOT be dropped. Checks the given dir (and, for a split-root sub-project, its cluster root is
+// passed by the caller). Returns true when symbols.jsonl exists and is non-empty.
+export function hasSyntacticIndex(dir) {
+  if (!dir) return false;
+  try {
+    const f = path.join(dir, ".vts-index", "symbols.jsonl");
+    return fs.statSync(f).size > 0;
+  } catch { return false; }
+}
+
 export function clangdIndexUsable(project) {
   if (!project) return true;
   let entries = [];

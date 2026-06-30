@@ -30,7 +30,7 @@ import readline from "node:readline";
 import crypto from "node:crypto";
 import http from "node:http";
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox } from "./config-loader.mjs";
+import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox, hasSyntacticIndex } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { logActivity, logLive, logFallback, isFailAnswer, liveRuns, setLiveExtra, pruneLiveRuns } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
@@ -380,13 +380,19 @@ function toOllamaTool(t) {
 // vs-search tools take a project root under one of these arg names. If Qwen omits it, inject the
 // configured project so the call lands on the target repo instead of the bridge's cwd.
 const ROOT_ARGS = ["projectPath", "root", "cwd"];
+// When ONLY the split-root CLUSTER has a syntactic symbol index (not the queried sub-project), symbol queries
+// must run against the cluster so engine symbols resolve. main() sets this to the cluster root in that case;
+// SYMBOL_INDEX_TOOLS are the tools whose answer comes from that index. Other tools keep using PROJECT.
+let SYMBOL_ROOT_OVERRIDE = null;
+const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols"]);
 function injectProject(toolSchema, args) {
   if (!PROJECT) return args;
   const props = toolSchema?.inputSchema?.properties || {};
+  const root = (SYMBOL_ROOT_OVERRIDE && SYMBOL_INDEX_TOOLS.has(toolSchema?.name)) ? SYMBOL_ROOT_OVERRIDE : PROJECT;
   for (const k of ROOT_ARGS) {
     // ALWAYS override — the model emits placeholders ("<your-project-path>") or wrong paths; force the real root.
     if (k in props) {
-      args[k] = PROJECT;
+      args[k] = root;
       break;
     }
   }
@@ -1539,6 +1545,18 @@ async function main() {
   const IDX_STATE = clangdIndexState(PROJECT);
   const NO_INDEX = !NARROW_OFF && !NARROW_SOFT && (IDX_STATE === "none" || IDX_STATE === "toobig");
   const FAST_FAIL = !INDEX_USABLE && NARROW_SOFT; // soft mode = the legacy "try with short timeouts" path
+  // SYNTACTIC TIER: `vts index` builds a tree-sitter symbols.jsonl that answers search_symbol/document_symbols
+  // instantly with NO clangd compile. If one exists (at the project OR its split-root cluster), the symbol tools
+  // DO work even when the compile DB is none/toobig — so DON'T drop them. Checks the cluster too, because the
+  // engine symbols live there and that's where the index covering them is built. SYMBOL_ROOT is the root whose
+  // .vts-index covers the most (cluster if it has one) — injected for symbol queries so they hit that index.
+  const SYN_AT_PROJECT = hasSyntacticIndex(PROJECT);
+  const SYN_AT_CLUSTER = WIDER_ROOT ? hasSyntacticIndex(WIDER_ROOT) : false;
+  const HAS_SYN = SYN_AT_PROJECT || SYN_AT_CLUSTER;
+  const SYMBOL_ROOT = SYN_AT_CLUSTER ? WIDER_ROOT : PROJECT; // cluster index covers engine + game → prefer it
+  // If ONLY the cluster has a syntactic index, route symbol queries to it (so an engine symbol resolves even
+  // when this run was scoped with -p to the game sub-project). When the project itself has one, keep PROJECT.
+  if (SYN_AT_CLUSTER && !SYN_AT_PROJECT) SYMBOL_ROOT_OVERRIDE = WIDER_ROOT;
   // LSP circuit breaker: learned per project across runs (lsp-stats). If the index-backed tools have a recent
   // history of ALL failures (timeouts) with zero successes, the index is provably unusable here — so DROP them
   // up front (this run) instead of wasting ~16s/call rediscovering that. If instead they DO succeed but slowly,
@@ -1709,10 +1727,19 @@ async function main() {
     // LSP timeouts above to fast-fail; OFF keeps them with the normal long waits. (INDEX_USABLE / NARROW_HARD
     // were computed before the spawn.)
     if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) {
-      requested = requested.filter((n) => !INDEX_TOOLS.has(n));
-      if (!CIRCUIT_OPEN && !NO_INDEX) process.stderr.write(
+      // A tree-sitter syntactic index answers search_symbol/document_symbols/read_symbol with NO clangd — so
+      // when one exists keep those and drop only the truly clangd-only tools (refs/def/hover/diagnostics/
+      // concept). Without a syntactic index, drop the whole clangd-backed set (index-free walk/grep only).
+      const SYN_OK = new Set(["search_symbol", "document_symbols", "read_symbol"]);
+      const dropSet = HAS_SYN ? new Set([...INDEX_TOOLS].filter((t) => !SYN_OK.has(t))) : INDEX_TOOLS;
+      requested = requested.filter((n) => !dropSet.has(n));
+      if (HAS_SYN) process.stderr.write(
+        `[vts-local] syntactic symbol index present (${SYMBOL_ROOT}\\.vts-index) — keeping search_symbol/` +
+          `document_symbols/read_symbol (tree-sitter tier, instant), dropping clangd-only refs/def/hover.\n`,
+      );
+      else if (!CIRCUIT_OPEN && !NO_INDEX) process.stderr.write(
         `[vts-local] QVTS_AUTO_NARROW=hard and no clangd index for ${PROJECT} — exposing index-free ` +
-          `locators only (generate compile_commands.json or set QVTS_TOOLS to enable symbol search).\n`,
+          `locators only (run \`vts index\` for a syntactic symbol tier, or generate compile_commands.json).\n`,
       );
     }
   }
