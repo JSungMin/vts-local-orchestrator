@@ -40,7 +40,11 @@ const context = [
   `  qvts digest "<file>" --focus "<question>"     → a brief (local model reads the file; you get the brief)`,
   `  qvts digest-dir "<dir>" --focus "<question>"  → per-file briefs + an overview for a whole module`,
   `  qvts triage-diff [--staged]                   → a git diff → {summary,hotspots,open}; open only flagged files`,
+  `  qvts vcs <p4|git> <read-only sub> --focus "…" → run a big p4/git query (p4 opened, git status/log/diff…)`,
+  `                                                  and get back a short summary, not the raw dump`,
   "Read a file directly only when you need its exact bytes to EDIT it, or for a small/just-edited file.",
+  "Don't run `p4 opened` / `git status` / `git log` in Bash just to read them — that dumps the whole list into",
+  "context; route them through `qvts vcs …` so only the summary returns.",
 ].join("\n");
 
 process.stdout.write(JSON.stringify({

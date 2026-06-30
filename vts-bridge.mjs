@@ -29,7 +29,7 @@ import path from "node:path";
 import readline from "node:readline";
 import crypto from "node:crypto";
 import http from "node:http";
-import { execSync, spawn } from "node:child_process";
+import { execSync, execFileSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable } from "./config-loader.mjs";
 import { definitionSearches, detectLang } from "./defn-patterns.mjs";
 import { logActivity, logLive } from "./activity-log.mjs";
@@ -1051,6 +1051,54 @@ async function main() {
       if (t.hotspots?.length) process.stdout.write("hotspots:\n" + t.hotspots.map((h) => `  ${h.file} — ${h.why}`).join("\n") + "\n");
       if (t.open?.length) process.stdout.write("open:\n" + t.open.map((f) => `  ${f}`).join("\n") + "\n");
     }
+    return;
+  }
+
+  // qvts vcs <p4|git> <read-only subcommand> [args…] [--focus "..."] — run a READ-ONLY version-control query
+  // and have the local model summarize its (often huge) output, so Claude gets a brief instead of the raw
+  // `p4 opened` / `git status` dump. execFile (no shell) + a strict allow-list of read-only subcommands ⇒ no
+  // shell injection and no mutating ops (submit/edit/commit/push/checkout are refused). Local model only.
+  if (sub === "vcs") {
+    const fi = rawArgs.indexOf("--focus");
+    const focus = fi !== -1 ? rawArgs[fi + 1] || "" : "";
+    const parts = rawArgs.slice(1).filter((a) => a !== "--json" && a !== "--no-cache" && a !== "--focus" && a !== focus);
+    const tool = parts[0];
+    const vargs = parts.slice(1);
+    const ALLOW = {
+      p4: /^(opened|changes|status|files|fstat|describe|diff|diff2|filelog|where|info|have|print|sizes|cstat|annotate)$/,
+      git: /^(status|diff|log|show|branch|ls-files|blame|shortlog|tag|remote|stash|rev-parse|describe|whatchanged)$/,
+    };
+    if (!ALLOW[tool] || !ALLOW[tool].test(vargs[0] || "")) {
+      process.stderr.write(`vcs: only READ-ONLY p4/git subcommands are allowed (got: ${tool} ${vargs[0] || ""}).\n`);
+      process.exit(2);
+    }
+    let out;
+    try {
+      out = execFileSync(tool, vargs, { cwd: PROJECT || process.cwd(), maxBuffer: 64 * 1024 * 1024, timeout: Number(process.env.QVTS_VCS_TIMEOUT_MS || 30000) }).toString();
+    } catch (e) {
+      out = (e.stdout ? e.stdout.toString() : "") + (e.stderr ? e.stderr.toString() : "") || `(${tool} failed: ${e.message})`;
+    }
+    if (!out.trim()) {
+      process.stdout.write((wantJson ? JSON.stringify({ mode: "vcs", tool, args: vargs, summary: "(no output)" }) : "(no output)") + "\n");
+      return;
+    }
+    const noCache = process.argv.includes("--no-cache");
+    const cmdLabel = `${tool} ${vargs.join(" ")}`;
+    const ch = sha1(out);
+    let brief = noCache ? null : contentCacheGet("vcs", ch, focus)?.brief;
+    if (brief) process.stderr.write("  · [cache hit] (no model run)\n");
+    else {
+      brief = await digestText(out, focus || `Summarize this \`${cmdLabel}\` output: group the items meaningfully (by area/status), call out anything notable, keep it short. Preserve exact file paths/changelist numbers.`);
+      if (!noCache) contentCachePut("vcs", ch, focus, { brief });
+    }
+    const origTok = estTok(out);
+    const savings = recordSavings(
+      { outTok: origTok, rawTok: origTok, byTool: { vcs: { calls: 1, outTok: origTok, rawTok: origTok } } },
+      brief,
+    );
+    logActivity({ project: PROJECT, kind: "vcs", task: cmdLabel, result: brief, savings });
+    if (wantJson) process.stdout.write(JSON.stringify({ mode: "vcs", tool, args: vargs, summary: brief, savings }) + "\n");
+    else process.stdout.write("\n" + brief + "\n");
     return;
   }
 
