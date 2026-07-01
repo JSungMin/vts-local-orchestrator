@@ -880,11 +880,14 @@ there is no toolchain). They return COMPACT file:line results, never whole files
 ask to read entire files.
 
 Pick the right tool:
-- WHERE IS X DECLARED / DEFINED -> def_search name="X" (FIRST choice when available). It builds the correct
-  definition regex for the language and skips usages/#includes/comments — far more reliable than a bare
-  search_text. Use it before search_symbol/search_text for any declaration hunt. Pass lang="cpp|csharp|ts|
-  js|python|go|java|rust" only to override the auto-detected language. Report the file:line it returns.
-- Find a symbol/class/function/type/variable -> search_symbol. Never guess paths.
+- WHERE IS X DECLARED / DEFINED:
+  * search_symbol name="X" is your FIRST choice IF it is in your tool list — a symbol index (clangd OR the
+    tree-sitter syntactic tier) resolves the declaration INSTANTLY and exactly. Try it before anything else;
+    do NOT open with a def_search/search_text sweep when search_symbol is available.
+  * ONLY if search_symbol is ABSENT (no index — text tools only) use def_search name="X": it builds the
+    language's definition regex and skips usages/#includes/comments — far better than a bare search_text.
+    Pass lang="cpp|csharp|ts|js|python|go|java|rust" only to override auto-detect. Report the file:line returned.
+- Find a symbol/class/function/type/variable -> search_symbol (index lookup, instant on the syntactic tier).
 - Find a file by name -> find_files.
 - Who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
 - Raw strings/comments/config keys the symbol index can't answer -> search_text.
