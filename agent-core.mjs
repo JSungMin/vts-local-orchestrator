@@ -36,8 +36,10 @@ there is no toolchain). They return COMPACT file:line results, never whole files
 ask to read entire files.
 
 Pick the right tool:
-- WHERE IS X DECLARED / DEFINED -> def_search name="X" (FIRST choice). Builds the right definition regex per
-  language, skips usages/#includes/comments. Use before search_symbol/search_text for any declaration hunt.
+- WHERE IS X DECLARED / DEFINED: search_symbol name="X" FIRST if it is in your tool list — a symbol index
+  (clangd OR the tree-sitter syntactic tier) resolves it INSTANTLY and exactly, so try it before any
+  def_search/search_text sweep. ONLY if search_symbol is ABSENT (no index) use def_search name="X" (definition
+  regex per language, skips usages/#includes/comments).
 - Find a symbol/class/function/type/variable -> search_symbol. Never guess paths.
 - Find a file by name -> find_files.
 - who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
