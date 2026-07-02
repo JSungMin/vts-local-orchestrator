@@ -410,7 +410,7 @@ const ROOT_ARGS = ["projectPath", "root", "cwd"];
 // must run against the cluster so engine symbols resolve. main() sets this to the cluster root in that case;
 // SYMBOL_INDEX_TOOLS are the tools whose answer comes from that index. Other tools keep using PROJECT.
 let SYMBOL_ROOT_OVERRIDE = null;
-const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols"]);
+const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols", "find_references"]); // find_references: the server (vts ≥0.42.7) answers it from the committed index + decl-file usage scan on crawl-risk trees, so it needs the CLUSTER root too — scoped to the game sub-project it can't see an engine-side symbol at all (live: who-calls dead-ended while the decl+callers sat one level up).
 function injectProject(toolSchema, args) {
   if (!PROJECT) return args;
   const props = toolSchema?.inputSchema?.properties || {};
@@ -642,6 +642,27 @@ function parseToolCallsFromText(content, validNames) {
   const sources = tagged.length ? tagged : [content];
   const calls = [];
   const seen = new Set();
+  // gemma-style BARE calls: `tool_name {json-args}` as plain text — no {name,arguments} wrapper, no tags,
+  // no fence. Seen live twice in one day: the model printed the call as its final content, every pass
+  // below missed it (the JSON blob has no `name` field), and the raw call text shipped as the "answer".
+  // Per-line so several stacked calls all parse; only exact valid tool names match, so prose is immune.
+  for (const line of String(content).split("\n")) {
+    const m = /^\s*([A-Za-z_]\w*)\s*(\{.*\})\s*$/.exec(line);
+    if (!m || !validNames.has(m[1])) continue;
+    // gemma emission repair: literal quote tokens (`<|"|>`) leak into the text form, and keys can arrive
+    // unquoted (`{symbol:"X"}`). Try strict JSON first, then the artifact-repaired/relaxed form.
+    const jsonish = m[2].replace(/<\|"\|>/g, '"');
+    for (const cand of [jsonish, jsonish.replace(/([{,]\s*)([A-Za-z_]\w*)\s*:/g, '$1"$2":')]) {
+      let args;
+      try { args = JSON.parse(cand); } catch { continue; }
+      if (args && typeof args === "object" && !Array.isArray(args)) {
+        const key = m[1] + JSON.stringify(args);
+        if (!seen.has(key)) { seen.add(key); calls.push({ function: { name: m[1], arguments: args } }); }
+        break;
+      }
+    }
+  }
+  if (calls.length) return calls;
   for (const src of sources) {
     for (const blob of extractJsonBlobs(src)) {
       let parsed;
@@ -951,6 +972,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
     } catch { /* pre-step is best-effort — the normal loop proceeds without it */ }
   }
 
+  let malformedRetries = 0; // corrective retries when the model prints a broken tool call as its "answer"
   for (let step = 0; step < MAX_STEPS; step++) {
     const msg = await ollamaChat(messages, ollamaTools);
     messages.push(msg);
@@ -959,8 +981,17 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
     let calls = msg.tool_calls || [];
     if (!calls.length) calls = parseToolCallsFromText(msg.content, validNames);
     if (!calls.length) {
+      // Final content that LOOKS like an attempted tool call (a valid tool name glued to a brace blob)
+      // but survived no parser pass is a MALFORMED EMISSION, not an answer — returning it verbatim ships
+      // a raw call string to the caller as the "answer" (live, twice in one day). Give the model a
+      // bounded number of corrective retries inside the same run instead.
+      const looksCall = /^\s*([A-Za-z_]\w*)\s*\{/.exec(msg.content || "");
+      if (looksCall && validNames.has(looksCall[1]) && malformedRetries++ < 2) {
+        messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
+        continue;
+      }
       prog({ kind: "final", answer: msg.content || "(no answer)" });
-      return { answer: msg.content || "(no answer)", trace, acct };
+      return { answer: msg.content || "(no answer)", trace, acct, results: [...executed.values()] };
     }
 
     for (const call of calls) {
@@ -986,7 +1017,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
             `Do NOT repeat it — give your FINAL answer, or try a different name/lang.`;
           if (dupCount >= 3) {
             messages.push({ role: "tool", content: resultText, tool_name: name });
-            return { answer: "(stopped: the local model looped on def_search.)", trace, acct };
+            return { answer: "(stopped: the local model looped on def_search.)", trace, acct, results: [...executed.values()] };
           }
         } else {
           dupCount = 0;
@@ -1004,7 +1035,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
             unproductive++;
             if (unproductive >= 4) {
               messages.push({ role: "tool", content: resultText.slice(0, 8000), tool_name: name });
-              return { answer: "(stopped: no results after 4 tries — likely misspelled or absent.)", trace, acct };
+              return { answer: "(stopped: no results after 4 tries — likely misspelled or absent.)", trace, acct, results: [...executed.values()] };
             }
           } else {
             unproductive = 0;
@@ -1111,7 +1142,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
       });
     }
   }
-  return { answer: `(stopped: hit ${MAX_STEPS}-step limit without a final answer)`, trace, acct };
+  return { answer: `(stopped: hit ${MAX_STEPS}-step limit without a final answer)`, trace, acct, results: [...executed.values()] };
 }
 
 // One locate: cache-check → run the model on a FRESH history (independent of other queries) → cache-write
@@ -1143,6 +1174,31 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     // and the judgment reaches the orchestrator instead of being discarded.
     const nm = /(?:^|\n)note:\s*(.+)\s*$/i.exec(raw);
     if (nm) { note = nm[1].trim().slice(0, 300); raw = raw.slice(0, nm.index).trim(); }
+    // ANTI-HALLUCINATION GUARD: every location line in the final answer must have appeared in SOME tool
+    // result this run. A small model handed an error result can FABRICATE well-formed paths wholesale
+    // (live: a find_references TOOL ERROR was "answered" with three plausible file:line paths that exist
+    // nowhere in the repo). Paths the tools never returned are dropped; if nothing survives, the honest
+    // answer is "no match". Prose lines pass through untouched.
+    {
+      const blob = (r.results || []).join("\n").replace(/\\/g, "/");
+      if (blob) {
+        let dropped = 0;
+        const kept = raw.split("\n").filter((ln) => {
+          const m = /^\s*(.+?):(\d+(?:,\d+)*)\s*$/.exec(ln);
+          if (!m || !/[/\\.]/.test(m[1])) return true; // not a location line → keep
+          const p = m[1].trim().replace(/\\/g, "/");
+          if (blob.includes(p)) return true;
+          const tail = p.split("/").slice(-2).join("/"); // rel-vs-abs mismatch → match by trailing segment
+          if (tail && blob.includes(tail)) return true;
+          dropped++;
+          return false;
+        });
+        if (dropped) {
+          raw = kept.join("\n").trim() || "no match";
+          note = ((note ? note + "; " : "") + `${dropped} fabricated path(s) discarded — not present in any tool result`).slice(0, 300);
+        }
+      }
+    }
     out = groupLocLines(relAnswer(raw));
     trace = r.trace;
     acct = r.acct;
@@ -1747,14 +1803,17 @@ async function main() {
     // were computed before the spawn.)
     if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) {
       // A tree-sitter syntactic index answers search_symbol/document_symbols/read_symbol with NO clangd — so
-      // when one exists keep those and drop only the truly clangd-only tools (refs/def/hover/diagnostics/
-      // concept). Without a syntactic index, drop the whole clangd-backed set (index-free walk/grep only).
-      const SYN_OK = new Set(["search_symbol", "document_symbols", "read_symbol"]);
+      // when one exists keep those and drop only the truly clangd-only tools (def/hover/diagnostics/concept).
+      // find_references is ALSO kept: the server (vts ≥0.42.7) pre-empts a by-name refs query on such trees
+      // with time-boxed literal usage lines + the committed-index declaration, so it never blocks on a clangd
+      // crawl — dropping it made every "who calls X" task dead-end at the declaration (live dogfood).
+      // Without a syntactic index, drop the whole clangd-backed set (index-free walk/grep only).
+      const SYN_OK = new Set(["search_symbol", "document_symbols", "read_symbol", "find_references"]);
       const dropSet = HAS_SYN ? new Set([...INDEX_TOOLS].filter((t) => !SYN_OK.has(t))) : INDEX_TOOLS;
       requested = requested.filter((n) => !dropSet.has(n));
       if (HAS_SYN) process.stderr.write(
         `[vts-local] syntactic symbol index present (${SYMBOL_ROOT}\\.vts-index) — keeping search_symbol/` +
-          `document_symbols/read_symbol (tree-sitter tier, instant), dropping clangd-only refs/def/hover.\n`,
+          `document_symbols/read_symbol/find_references (tree-sitter tier + text-usage fallback), dropping clangd-only def/hover.\n`,
       );
       else if (!CIRCUIT_OPEN && !NO_INDEX) process.stderr.write(
         `[vts-local] QVTS_AUTO_NARROW=hard and no clangd index for ${PROJECT} — exposing index-free ` +
