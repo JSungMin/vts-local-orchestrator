@@ -444,7 +444,7 @@ const ROOT_ARGS = ["projectPath", "root", "cwd"];
 // must run against the cluster so engine symbols resolve. main() sets this to the cluster root in that case;
 // SYMBOL_INDEX_TOOLS are the tools whose answer comes from that index. Other tools keep using PROJECT.
 let SYMBOL_ROOT_OVERRIDE = null;
-const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols", "find_references"]); // find_references: the server (vts ≥0.42.7) answers it from the committed index + decl-file usage scan on crawl-risk trees, so it needs the CLUSTER root too — scoped to the game sub-project it can't see an engine-side symbol at all (live: who-calls dead-ended while the decl+callers sat one level up).
+const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols", "find_references", "read_symbol"]); // find_references: the server (vts ≥0.42.7) answers it from the committed index + decl-file usage scan on crawl-risk trees, so it needs the CLUSTER root too — scoped to the game sub-project it can't see an engine-side symbol at all (live: who-calls dead-ended while the decl+callers sat one level up).
 function injectProject(toolSchema, args) {
   if (!PROJECT) return args;
   const props = toolSchema?.inputSchema?.properties || {};
