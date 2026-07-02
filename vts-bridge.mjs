@@ -141,6 +141,25 @@ function relAnswer(s) {
     .join("");
 }
 
+// Compact a final answer's location lines: hits in the same file collapse to `path:l1,l2,l3`. The prompt
+// ASKS the model to group, but a small model often doesn't (live: 25 one-per-line hits repeating the same
+// long path prefix 25×, straight into Claude's context). Conservative: only rewrites when EVERY non-empty
+// line is a `path:line(s)` location — a prose or mixed answer passes through untouched.
+function groupLocLines(s) {
+  const lines = String(s).split("\n").filter((l) => l.trim());
+  if (lines.length < 2) return s;
+  const order = [];
+  const byFile = new Map();
+  for (const ln of lines) {
+    const m = /^\s*(.+?):(\d+(?:,\d+)*)\s*$/.exec(ln);
+    if (!m || !/[/\\.]/.test(m[1])) return s; // any non-location line → leave the whole answer alone
+    if (!byFile.has(m[1])) { byFile.set(m[1], []); order.push(m[1]); }
+    byFile.get(m[1]).push(m[2]);
+  }
+  if (byFile.size === lines.length) return s; // nothing to merge
+  return order.map((f) => `${f}:${byFile.get(f).join(",")}`).join("\n");
+}
+
 // ---- token-savings ledger -------------------------------------------------------------------------
 // The whole point of delegation: Claude pays only for the compact final answer, not the raw search loop.
 // We estimate, per delegation, what Claude WOULD have spent under each strategy and persist the running
@@ -1124,7 +1143,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     // and the judgment reaches the orchestrator instead of being discarded.
     const nm = /(?:^|\n)note:\s*(.+)\s*$/i.exec(raw);
     if (nm) { note = nm[1].trim().slice(0, 300); raw = raw.slice(0, nm.index).trim(); }
-    out = relAnswer(raw);
+    out = groupLocLines(relAnswer(raw));
     trace = r.trace;
     acct = r.acct;
     if (cacheable && !isFailAnswer(out)) cacheWrite(key, fp, { answer: out, trace, acct, note }); // don't persist failures (see above)
