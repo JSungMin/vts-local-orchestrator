@@ -141,6 +141,40 @@ function relAnswer(s) {
     .join("");
 }
 
+// ANTI-FABRICATION GUARD v2. v1 only checked that the PATH string appeared somewhere in the run's tool
+// results — case-SENSITIVELY and ignoring line numbers entirely — so (a) a REAL path with an INVENTED
+// `:line` sailed straight through (the most plausible fabrication mode), and (b) tsserver's lowercase
+// drive letters (`g:/…`) risked false drops of legitimate answers on case-insensitive Windows paths.
+// v2 rules, all case-insensitive:
+//   - a location line's PATH must appear in some tool-result line (full match, or by its trailing two
+//     path segments to bridge rel-vs-abs differences);
+//   - each claimed LINE NUMBER must appear as a number token on one of THOSE path-bearing result lines
+//     (results arrive as `path:53: func x` and grouped `path:l1,l2`, so token matching covers both);
+//   - verified numbers are kept, unverified numbers dropped; a line with no verified number is dropped.
+// Prose lines pass through untouched. Returns the filtered answer + what was discarded, so the caller can
+// surface an honest note instead of silently shipping invented locations.
+function verifyAnswerPaths(raw, results) {
+  const blobLines = String((results || []).join("\n")).replace(/\\/g, "/").toLowerCase().split("\n").filter(Boolean);
+  if (!blobLines.length || !String(raw || "").trim()) return { raw, droppedPaths: 0, droppedLines: 0 };
+  let droppedPaths = 0, droppedLines = 0;
+  const kept = String(raw).split("\n").map((ln) => {
+    const m = /^\s*(.+?):(\d+(?:,\d+)*)\s*$/.exec(ln);
+    if (!m || !/[/\\.]/.test(m[1])) return ln;             // prose / non-location line → untouched
+    const p = m[1].trim().replace(/\\/g, "/").toLowerCase();
+    const tail = p.split("/").slice(-2).join("/");
+    const carriers = blobLines.filter((bl) => bl.includes(p) || (tail && bl.includes(tail)));
+    if (!carriers.length) { droppedPaths++; return null; } // path never appeared in any tool result
+    const nums = new Set();
+    for (const c of carriers) for (const t of c.match(/\d+/g) || []) nums.add(t);
+    const claimed = m[2].split(",");
+    const verified = claimed.filter((n) => nums.has(n));
+    droppedLines += claimed.length - verified.length;
+    if (!verified.length) { droppedPaths++; return null; } // real path, every line number invented
+    return `${m[1].trim()}:${verified.join(",")}`;
+  }).filter((x) => x !== null);
+  return { raw: kept.join("\n").trim(), droppedPaths, droppedLines };
+}
+
 // Compact a final answer's location lines: hits in the same file collapse to `path:l1,l2,l3`. The prompt
 // ASKS the model to group, but a small model often doesn't (live: 25 one-per-line hits repeating the same
 // long path prefix 25×, straight into Claude's context). Conservative: only rewrites when EVERY non-empty
@@ -972,6 +1006,12 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
     } catch { /* pre-step is best-effort — the normal loop proceeds without it */ }
   }
 
+  // Source-side inoculation against fabrication: a failed tool result is where the model started INVENTING
+  // plausible paths (live: a find_references timeout was "answered" with three nonexistent files). Say so
+  // right in the error result, at the moment the model reads it — cheaper and earlier than the output guard.
+  const ERR_NO_INVENT =
+    "\n(This tool call FAILED — the text above is an error, NOT evidence. Do not invent file paths or line " +
+    "numbers from it. Try a different tool or different args; if nothing succeeds, answer exactly: no match)";
   let malformedRetries = 0; // corrective retries when the model prints a broken tool call as its "answer"
   for (let step = 0; step < MAX_STEPS; step++) {
     const msg = await ollamaChat(messages, ollamaTools);
@@ -1078,9 +1118,9 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
             resultText = (out.content || [])
               .map((c) => (c.type === "text" ? c.text : JSON.stringify(c)))
               .join("\n");
-            if (out.isError) resultText = `TOOL ERROR:\n${resultText}`;
+            if (out.isError) resultText = `TOOL ERROR:\n${resultText}${ERR_NO_INVENT}`;
           } catch (e) {
-            resultText = `TOOL EXCEPTION: ${e.message}`;
+            resultText = `TOOL EXCEPTION: ${e.message}${ERR_NO_INVENT}`;
           }
           // LSP circuit-breaker ledger: record whether this index-backed tool actually worked, and how long it
           // took, so the NEXT run can drop it (unindexed tree → always fails ~16s) or size its timeout (slow
@@ -1174,29 +1214,14 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     // and the judgment reaches the orchestrator instead of being discarded.
     const nm = /(?:^|\n)note:\s*(.+)\s*$/i.exec(raw);
     if (nm) { note = nm[1].trim().slice(0, 300); raw = raw.slice(0, nm.index).trim(); }
-    // ANTI-HALLUCINATION GUARD: every location line in the final answer must have appeared in SOME tool
-    // result this run. A small model handed an error result can FABRICATE well-formed paths wholesale
-    // (live: a find_references TOOL ERROR was "answered" with three plausible file:line paths that exist
-    // nowhere in the repo). Paths the tools never returned are dropped; if nothing survives, the honest
-    // answer is "no match". Prose lines pass through untouched.
+    // Anti-fabrication guard (see verifyAnswerPaths): a small model handed an error result can invent
+    // well-formed paths — or attach invented line numbers to real paths. Only tool-verified locations ship.
     {
-      const blob = (r.results || []).join("\n").replace(/\\/g, "/");
-      if (blob) {
-        let dropped = 0;
-        const kept = raw.split("\n").filter((ln) => {
-          const m = /^\s*(.+?):(\d+(?:,\d+)*)\s*$/.exec(ln);
-          if (!m || !/[/\\.]/.test(m[1])) return true; // not a location line → keep
-          const p = m[1].trim().replace(/\\/g, "/");
-          if (blob.includes(p)) return true;
-          const tail = p.split("/").slice(-2).join("/"); // rel-vs-abs mismatch → match by trailing segment
-          if (tail && blob.includes(tail)) return true;
-          dropped++;
-          return false;
-        });
-        if (dropped) {
-          raw = kept.join("\n").trim() || "no match";
-          note = ((note ? note + "; " : "") + `${dropped} fabricated path(s) discarded — not present in any tool result`).slice(0, 300);
-        }
+      const v = verifyAnswerPaths(raw, r.results);
+      if (v.droppedPaths || v.droppedLines) {
+        raw = v.raw || "no match";
+        note = ((note ? note + "; " : "") +
+          `fabrication guard: discarded ${v.droppedPaths} path(s) / ${v.droppedLines} line number(s) not present in any tool result`).slice(0, 300);
       }
     }
     out = groupLocLines(relAnswer(raw));
@@ -2027,10 +2052,14 @@ async function main() {
     if (!task) return rl.prompt();
     if (/^(exit|quit|:q)$/i.test(task)) return rl.close();
     try {
-      const { answer, acct } = await runAgent(client, tools, ollamaTools, task, history);
-      const out = relAnswer(answer);
+      const { answer, acct, results } = await runAgent(client, tools, ollamaTools, task, history);
+      // Same fabrication guard as the one-shot/daemon path — the REPL was the one uncovered surface.
+      const v = verifyAnswerPaths(answer, results);
+      const out = relAnswer(v.raw || "no match");
       recordSavings(acct, out);
-      process.stdout.write("\n" + out + "\n\n");
+      process.stdout.write("\n" + out + "\n");
+      if (v.droppedPaths || v.droppedLines) process.stdout.write(`(fabrication guard: discarded ${v.droppedPaths} path(s) / ${v.droppedLines} line number(s) not present in any tool result)\n`);
+      process.stdout.write("\n");
     } catch (e) {
       process.stdout.write(`\nERROR: ${e.message}\n\n`);
     }
