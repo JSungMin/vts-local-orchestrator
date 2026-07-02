@@ -80,7 +80,11 @@ export function definitionSearches(name, lang) {
       // so a usage statement (`return Significance;`) isn't matched. Name must be FOLLOWED by [=;[] (not `(`,
       // which would be a function). Covers the common "where is the uint8 Foo member declared" hunt that the
       // type/enum/function patterns all miss. headerish: members are declared in the header.
-      add(`^\\s*(UPROPERTY\\s*\\([^)]*\\)\\s*)?(uint8|uint16|uint32|uint64|int8|int16|int32|int64|int|float|double|bool|FString|FName|FText|[A-Z]\\w+(<[^>]*>)?|[A-Za-z_]\\w*\\s*[*&])\\s+\\*?&?${N}\\s*(\\[[^\\]]*\\])?\\s*(=[^;]*)?;`, "field", true);
+      // Template args are `<[^;{}]*>` (greedy, statement-char-bounded), NOT `<[^>]*>` — the latter stops at
+      // the first `>`, so a NESTED template member (`TMultiMap<TObjectPtr<UObj>, FName> Name;`) failed to
+      // match and def_search returned a confident "no declaration" for a symbol sitting right in the scanned
+      // header (live dogfood miss). `;{}` can't appear inside template args, so greedy-to-last-`>` is safe.
+      add(`^\\s*(UPROPERTY\\s*\\([^)]*\\)\\s*)?(uint8|uint16|uint32|uint64|int8|int16|int32|int64|int|float|double|bool|FString|FName|FText|[A-Z]\\w+(<[^;{}]*>)?|[A-Za-z_]\\w*\\s*[*&])\\s+\\*?&?${N}\\s*(\\[[^\\]]*\\])?\\s*(=[^;]*)?;`, "field", true);
       add(`\\b${N}\\s*\\([^;{]*\\)\\s*(const)?\\s*\\{`, "function-def", false); // body, not a prototype
       add(`\\b${N}\\s*\\(`, "function-decl", false);
       break;

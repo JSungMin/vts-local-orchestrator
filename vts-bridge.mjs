@@ -68,20 +68,26 @@ function stripProjectArgs(arr) {
   }
   return out;
 }
+// Returns { path, source } so callers can warn when we fell back to a STALE global default that may not
+// match where this process was actually launched from — a bare `node vts-bridge.mjs` (no -p, no env) used
+// to silently reuse whatever project setup.ps1 last pinned, searching a completely unrelated repo with no
+// indication anything was wrong (live dogfood: 3 queries in a row silently misrouted to a stale UE-game
+// default while run from an unrelated JS repo, each returning a confident-looking "no match").
 function readProjectPath() {
   const fromArg = projectFromArgv();        // explicit -p wins for a one-shot…
-  if (fromArg) return fromArg;
-  if (process.env.VTS_PROJECT) return process.env.VTS_PROJECT; // …else env (set by qvts.sh/.ps1 + daemon)…
+  if (fromArg) return { path: fromArg, source: "arg" };
+  if (process.env.VTS_PROJECT) return { path: process.env.VTS_PROJECT, source: "env" }; // …else env (set by qvts.sh/.ps1 + daemon)…
   try {
     const cfg = JSON.parse(
       fs.readFileSync(path.join(os.homedir(), ".vs-token-safer", "config.json"), "utf8"),
     );
-    return cfg.projectPath || null;          // …else the configured default root.
+    if (cfg.projectPath) return { path: cfg.projectPath, source: "config-default" }; // …else the configured default root.
   } catch {
-    return null;
+    /* no config file yet */
   }
+  return { path: null, source: "none" };
 }
-const PROJECT = readProjectPath();
+const { path: PROJECT, source: PROJECT_SOURCE } = readProjectPath();
 
 // ---- split-root / cluster widening ----------------------------------------------------------------
 // A delegated locate is scoped to PROJECT (often the GAME/package sub-folder, picked by -p or active-project
@@ -959,6 +965,27 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
     );
   };
 
+  // Deterministic file-scope pre-step: when the task NAMES a code file ("find X declaration in Foo.h"),
+  // resolve that file with find_files BEFORE the model plans anything and hand the path(s) over as ground
+  // truth in the task itself. A small local model reliably COPIES a provided path into `search_text path=…`
+  // but only unreliably THINKS to run find_files first — a live miss chained search_text(whole tree → MCP
+  // timeout) → def_search(no hit) → "no match" for a symbol whose exact file was named right in the task.
+  const fileMention = /\b([A-Za-z_][\w.-]*\.(?:h|hpp|hh|hxx|inl|ipp|tpp|c|cc|cxx|cpp|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|py|pyi))\b/i.exec(task);
+  if (fileMention && validNames.has("find_files")) {
+    try {
+      const ffArgs = { q: fileMention[1], projectPath: PROJECT || undefined };
+      const out = await client.callTool({ name: "find_files", arguments: ffArgs });
+      const txt = (out.content || []).map((c) => (c.type === "text" ? c.text : "")).join("\n").trim();
+      trace.push({ tool: "find_files", args: { q: fileMention[1] }, pre: true });
+      if (txt && !isEmpty(txt)) {
+        messages[messages.length - 1].content +=
+          `\n\n[pre-resolved] find_files("${fileMention[1]}") already ran; result:\n${txt.slice(0, 600)}\n` +
+          `Scope your search to that file (search_text q="<term>" path="<the path above>", or document_symbols on it) instead of scanning the whole tree.`;
+        prog({ kind: "tool", tool: "find_files", args: ffArgs, pre: true });
+      }
+    } catch { /* pre-step is best-effort — the normal loop proceeds without it */ }
+  }
+
   for (let step = 0; step < MAX_STEPS; step++) {
     const msg = await ollamaChat(messages, ollamaTools);
     messages.push(msg);
@@ -1064,7 +1091,13 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
           // index). A timeout / error / empty-on-an-index-tool counts as a failure.
           if (LSP_TRACK.has(name)) {
             const okLsp = !/^TOOL E|timed out|workspace\/symbol|not ready|no .*index/i.test(resultText);
-            const definitive = /no compile_commands|needs compile_commands|no usable index/i.test(resultText);
+            // "needs compile_commands.json" is a CLANGD verdict — it's only a permanent no-index truth on a
+            // C/C++ tree. On a js/ts/python/csharp project the same text means the server routed the query to
+            // the wrong backend (tsserver/pyright/Roslyn could still serve), so recording it definitive there
+            // poisoned the ledger and banished search_symbol from a healthy repo (live dogfood 2026-07-02).
+            const lang = detectLang(PROJECT);
+            const cppish = lang === "cpp" || lang == null;
+            const definitive = cppish && /no compile_commands|needs compile_commands|no usable index/i.test(resultText);
             recordLspOutcome(PROJECT, name, okLsp, Date.now() - _t0, definitive);
           }
           prog({ kind: "result", tool: name, preview: resultText.slice(0, 160) });
@@ -1124,7 +1157,12 @@ async function locate(client, tools, ollamaTools, query, noCache) {
   const key = cacheKey(MODEL, PROJECT, query);
   let out, trace, acct, cached = false;
   const t0 = Date.now();
-  const hit = cacheable ? cacheRead(key, fp) : null;
+  // Never SERVE a cached failure: a "no match" may be the artifact of a since-fixed bug (bad pattern, wrong
+  // scope, dropped tool) rather than a truth about the code — replaying it makes the failure permanent and
+  // masks every later fix (live dogfood: a wrong "no match" kept being replayed verbatim after the underlying
+  // search bug was fixed). Successful answers stay cached as before; failures always re-run.
+  const rawHit = cacheable ? cacheRead(key, fp) : null;
+  const hit = rawHit && !isFailAnswer(rawHit.answer) ? rawHit : null;
   if (hit) {
     ({ answer: out, trace, acct } = hit);
     cached = true;
@@ -1137,7 +1175,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     out = relAnswer(r.answer);
     trace = r.trace;
     acct = r.acct;
-    if (cacheable) cacheWrite(key, fp, { answer: out, trace, acct });
+    if (cacheable && !isFailAnswer(out)) cacheWrite(key, fp, { answer: out, trace, acct }); // don't persist failures (see above)
   }
   const savings = recordSavings(acct, out); // credited even on a cache hit (Claude avoided the cost again)
   // Activity bus: a locate via def_search is its own kind; otherwise generic "locate". tools = trace tool names.
@@ -1524,6 +1562,13 @@ async function main() {
     );
   } else {
     process.stderr.write(`project: ${PROJECT}\nmodel:   ${MODEL}\n`);
+    if (PROJECT_SOURCE === "config-default" && path.resolve(PROJECT) !== path.resolve(process.cwd())) {
+      process.stderr.write(
+        `WARN: no -p/--project or VTS_PROJECT given — using the STALE default from ` +
+          `~/.vs-token-safer/config.json, which does NOT match cwd (${process.cwd()}). ` +
+          `This search runs against ${PROJECT}, not the directory you're standing in. Pass -p explicitly.\n`,
+      );
+    }
   }
 
   // AUTO-NARROW mode (default "soft"). On an UNINDEXED C/C++ tree the clangd-backed tools can't answer, so:
