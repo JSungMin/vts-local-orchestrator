@@ -2020,11 +2020,12 @@ async function main() {
   const oneShot = argv.join(" ").trim();
 
   if (oneShot) {
-    const { answer: out, trace, savings, cached } = await locate(client, tools, ollamaTools, oneShot, noCache);
+    const { answer: out, note, trace, savings, cached } = await locate(client, tools, ollamaTools, oneShot, noCache);
     if (JSON_OUT || process.env.QVTS_JSON === "1") {
-      process.stdout.write(JSON.stringify(slimOne({ task: oneShot, answer: out, trace, savings, cached })) + "\n");
+      process.stdout.write(JSON.stringify(slimOne({ task: oneShot, answer: out, note, trace, savings, cached })) + "\n");
     } else {
       process.stdout.write("\n" + out + "\n");
+      if (note) process.stdout.write("(" + note + ")\n");
     }
     // One-shot teardown. The answer is already on stdout. Dispose the vs-search server, then let the event
     // loop drain NATURALLY so the child-stdio handles close exactly once → deterministic rc 0. The old code
