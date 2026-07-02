@@ -46,9 +46,20 @@ export function recordLspOutcome(project, tool, ok, ms, definitive = false) {
   write(m);
 }
 
-// Verdict from history. circuitOpen: ZERO successes AND (≥minFails timeouts OR ANY definitive no-index error) →
-// drop the index tools. suggestedTimeoutMs: when successes DO exist, p90(success ms)·1.3 (clamped) so a slow
-// index gets right-sized time instead of a blanket short timeout.
+// Half-open TTL: an OPEN circuit drops the index tools, so no new attempt is ever made — without an expiry
+// the breaker can NEVER self-heal (zero successes forever, by construction). Worse, a definitive verdict can
+// be a MISCLASSIFICATION poisoning the ledger permanently (live dogfood 2026-07-02: a clangd "needs
+// compile_commands.json" text recorded definitive against a JS repo that tsserver serves fine — search_symbol
+// was banished from that repo until the user hand-deleted lsp-stats.json). So: the circuit only stays open
+// while the NEWEST failure is younger than TTL; after that the next run probes once (half-open). A failed
+// probe re-records and re-opens for another window — an actively-used unindexed tree pays one probe per TTL,
+// a stale/poisoned entry ages out on its own.
+const TTL_MS = (() => { const n = Number(process.env.QVTS_LSP_TTL_MS); return Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000; })();
+
+// Verdict from history. circuitOpen: ZERO successes AND (≥minFails timeouts OR ANY definitive no-index error)
+// AND the newest failure is still within TTL (else half-open: allow a probe) → drop the index tools.
+// suggestedTimeoutMs: when successes DO exist, p90(success ms)·1.3 (clamped) so a slow index gets right-sized
+// time instead of a blanket short timeout.
 export function lspVerdict(project, { minFails = 3 } = {}) {
   if (DISABLED || !project) return { circuitOpen: false, suggestedTimeoutMs: null, successes: 0, fails: 0 };
   const e = read()[project];
@@ -56,7 +67,9 @@ export function lspVerdict(project, { minFails = 3 } = {}) {
   const succ = o.filter((x) => x.ok);
   const fails = o.filter((x) => !x.ok);
   const definitive = fails.some((x) => x.definitive);
-  const circuitOpen = succ.length === 0 && (fails.length >= minFails || definitive);
+  const newestFailTs = fails.reduce((m, x) => Math.max(m, x.ts || 0), 0);
+  const fresh = Date.now() - newestFailTs < TTL_MS; // stale failures → half-open (probe again)
+  const circuitOpen = fresh && succ.length === 0 && (fails.length >= minFails || definitive);
   let suggestedTimeoutMs = null;
   if (succ.length) {
     const ms = succ.map((x) => x.ms).sort((a, b) => a - b);
