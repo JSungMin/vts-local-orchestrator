@@ -32,6 +32,7 @@ import http from "node:http";
 import { execSync, execFileSync, spawn } from "node:child_process";
 import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox, hasSyntacticIndex } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
+import { buildSystem } from "./system-prompt.mjs";
 import { logActivity, logLive, logFallback, isFailAnswer, liveRuns, setLiveExtra, pruneLiveRuns } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
 import { findOrphanVtsProcs, killTree } from "./proc-reap.mjs";
@@ -880,65 +881,10 @@ async function fetchUrlText(url) {
   return /html/i.test(ct) ? htmlToText(raw) : raw;
 }
 
-const SYSTEM = `You are a code-navigation agent for a software repository (any language — C/C++, C#, JS/TS,
-Python, etc.). You have vs-search tools backed by an official language-server index (or tree-sitter when
-there is no toolchain). They return COMPACT file:line results, never whole files — trust them and do NOT
-ask to read entire files.
-
-Pick the right tool:
-- WHERE IS X DECLARED / DEFINED:
-  * search_symbol name="X" is your FIRST choice IF it is in your tool list — a symbol index (clangd OR the
-    tree-sitter syntactic tier) resolves the declaration INSTANTLY and exactly. Try it before anything else;
-    do NOT open with a def_search/search_text sweep when search_symbol is available.
-  * ONLY if search_symbol is ABSENT (no index — text tools only) use def_search name="X": it builds the
-    language's definition regex and skips usages/#includes/comments — far better than a bare search_text.
-    Pass lang="cpp|csharp|ts|js|python|go|java|rust" only to override auto-detect. Report the file:line returned.
-- Find a symbol/class/function/type/variable -> search_symbol (index lookup, instant on the syntactic tier).
-- Find a file by name -> find_files.
-- Who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
-- Raw strings/comments/config keys the symbol index can't answer -> search_text.
-- search_text / find_files: do NOT pass a directory (and NEVER the project root or a GUESSED path) as
-  \`path\`/\`dir\` — \`path\` scopes to a single FILE, and a wrong path matches NOTHING. OMIT \`path\` to search the
-  WHOLE tree (the default); set it ONLY to a file path you saw in a previous result. Use \`glob\` (e.g. "*.h")
-  to limit by extension instead — never invent directory paths.
-- CONSTRUCTOR of a class X: a C++ constructor is \`X::X(\` in the .cpp (definition) or \`X(\` inside the class in
-  the .h (declaration). FIRST def_search name="X" to get the EXACT class name and file — UE classes carry an
-  A/U/F/S prefix (a class the user calls "Foo" is usually \`AFoo\`/\`UFoo\`), and the constructor uses that SAME
-  prefixed name. THEN search_text q="<ExactName>::<ExactName>" with NO path (whole tree) for the definition.
-  Don't guess the prefix or the path — read the real name out of the def_search result first.
-- DECLARATION hunt via search_text (no symbol index): ALWAYS search the DEFINITION pattern, never the bare
-  name — \`class .*Name\` / \`struct .*Name\` / \`enum .*Name\` for a type, \`Name\\s*\\(\` for a function. The
-  bare name floods with usages, #includes and comments, so on a big tree the time-box buries the one
-  declaration line and you wrongly conclude "no match". This holds even when the request names the type only
-  loosely (e.g. "the game-instance class" → search \`class .*GameInstance\`, glob "*.h").
-- UNINDEXED / NOT-YET-INDEXED C/C++: search_symbol / document_symbols may be ABSENT from your tool list, OR
-  present but return empty / "timed out" / an error fast (the clangd index isn't ready). In EITHER case do
-  NOT retry them — fall back immediately to the index-free chain:
-  1) find_files for the likely file (a class FooBar is usually in FooBar.h — for the FILENAME strip a leading
-     UE type prefix U/A/F/S/E, so UMyClass -> "MyClass").
-  2) search_text to pin the declaration line. Search the bare NAME as a SUBSTRING, or the regex
-     \`class .*Name\` — NOT the exact string "class Name". UE declarations read
-     \`class MODULE_API UName : public Base\`, so "class MyClass" finds nothing but "MyClass"
-     (or \`class .*MyClass\`) matches \`class UMyClass\`. Omit \`path\` (or set glob "*.h").
-  The \`file:line\` that search_text returns IS the answer — report it.
-
-Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
-- When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
-  directly. Do NOT run more searches to "double-check" a POSITIVE result, and never overturn a found result
-  into "no match".
-- Do not invent file paths, line numbers, or symbols. Only report what a tool actually returned.
-- Copy search terms from the request EXACTLY, character for character (spelling and case). A typo returns nothing.
-- Never call search_text with a catch-all pattern like ".*" — it is meaningless. Use a concrete term.
-- If a search genuinely returns no matches twice, STOP and report "no match" — do not keep guessing variants.
-
-FINAL ANSWER FORMAT (strict — your answer goes to another program, not a human):
-- Output ONLY the locations, one per line, as \`path:line\` (group several lines of one file as \`path:line1,line2\`).
-- NO prose, NO sentences, NO "The function is declared at…", NO markdown headers/bullets, NO code fences,
-  NO closing remarks like "Let me know if…". Just the bare \`path:line\` lines.
-- If nothing was found, output exactly: no match
-- Example of a GOOD final answer:
-  config-loader.mjs:40
-  agent-core.mjs:14,16`;
+// SYSTEM prompt lives in system-prompt.mjs (shared with agent-core.mjs — the two inline copies had
+// drifted). lite (default) = principles + few-shot, sized for the small local model; cpp lore appended
+// only on C/C++ trees; QVTS_PROMPT_STYLE=full restores the legacy rulebook verbatim (A/B fallback).
+const SYSTEM = buildSystem({ lang: detectLang(PROJECT) });
 
 async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgress) {
   const messages = history;
@@ -1155,7 +1101,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
   const fp = repoFingerprint(PROJECT);
   const cacheable = !noCache && !(fp.head && fp.dirty); // skip cache on a dirty git tree (content in flux)
   const key = cacheKey(MODEL, PROJECT, query);
-  let out, trace, acct, cached = false;
+  let out, trace, acct, note = null, cached = false;
   const t0 = Date.now();
   // Never SERVE a cached failure: a "no match" may be the artifact of a since-fixed bug (bad pattern, wrong
   // scope, dropped tool) rather than a truth about the code — replaying it makes the failure permanent and
@@ -1164,7 +1110,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
   const rawHit = cacheable ? cacheRead(key, fp) : null;
   const hit = rawHit && !isFailAnswer(rawHit.answer) ? rawHit : null;
   if (hit) {
-    ({ answer: out, trace, acct } = hit);
+    ({ answer: out, trace, acct, note = null } = hit);
     cached = true;
     process.stderr.write(`  · [cache hit] ${query}\n`);
   } else {
@@ -1172,10 +1118,16 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     const runId = crypto.randomUUID();
     const onProgress = (ev) => logLive({ runId, project: PROJECT, query, ...ev });
     const r = await runAgent(client, tools, ollamaTools, query, history, onProgress);
-    out = relAnswer(r.answer);
+    let raw = String(r.answer || "");
+    // `note:` escape line (lite prompt): the model's own judgment (uncertainty, stale index, next step)
+    // rides as ONE trailing line. Strip it into its own field so the path:line contract stays parseable
+    // and the judgment reaches the orchestrator instead of being discarded.
+    const nm = /(?:^|\n)note:\s*(.+)\s*$/i.exec(raw);
+    if (nm) { note = nm[1].trim().slice(0, 300); raw = raw.slice(0, nm.index).trim(); }
+    out = relAnswer(raw);
     trace = r.trace;
     acct = r.acct;
-    if (cacheable && !isFailAnswer(out)) cacheWrite(key, fp, { answer: out, trace, acct }); // don't persist failures (see above)
+    if (cacheable && !isFailAnswer(out)) cacheWrite(key, fp, { answer: out, trace, acct, note }); // don't persist failures (see above)
   }
   const savings = recordSavings(acct, out); // credited even on a cache hit (Claude avoided the cost again)
   // Activity bus: a locate via def_search is its own kind; otherwise generic "locate". tools = trace tool names.
@@ -1187,7 +1139,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
   // Delegation came up dry → drop a fallback marker so vs-token-safer's redirect hook lets Claude search
   // DIRECTLY for a short window (the protocol's fallback step) instead of re-blocking + trapping it.
   if (isFailAnswer(out)) logFallback({ query, project: PROJECT });
-  return { q: query, answer: out, trace, cached, savings };
+  return { q: query, answer: out, note, trace, cached, savings };
 }
 
 async function main() {
@@ -1272,8 +1224,8 @@ async function main() {
   // echoing it on stdout would spend the very tokens delegation exists to save (a locate's trace can be 10–50×
   // the answer). Pass --trace to get the full object. slimOne for one-shots, slimBatch keeps `q` to map results.
   const wantTrace = process.argv.includes("--trace");
-  const slimOne = (full) => (wantTrace ? full : { answer: full.answer, saved: full.savings ? full.savings.savedVsGrep : undefined });
-  const slimBatch = (r) => (wantTrace ? r : { q: r.q, answer: r.answer, saved: r.savings ? r.savings.savedVsGrep : undefined });
+  const slimOne = (full) => (wantTrace ? full : { answer: full.answer, note: full.note || undefined, saved: full.savings ? full.savings.savedVsGrep : undefined });
+  const slimBatch = (r) => (wantTrace ? r : { q: r.q, answer: r.answer, note: r.note || undefined, saved: r.savings ? r.savings.savedVsGrep : undefined });
 
   // Preflight the local model for every path that USES it (i.e. all but the savings ledger — handled above —
   // and a daemon stop/status query). Converts a later cryptic "fetch failed" / empty-model crash into one
@@ -1547,7 +1499,7 @@ async function main() {
       if (oneShotEarly) {
         const r = await httpJson("POST", st.port, "/locate", { query: oneShotEarly, noCache });
         if (r.status === 200 && r.json) {
-          if (wantJson) process.stdout.write(JSON.stringify(wantTrace ? { task: oneShotEarly, answer: r.json.answer, trace: r.json.trace, savings: r.json.savings, cached: r.json.cached, viaDaemon: true } : { answer: r.json.answer, saved: r.json.savings ? r.json.savings.savedVsGrep : undefined, viaDaemon: true }) + "\n");
+          if (wantJson) process.stdout.write(JSON.stringify(wantTrace ? { task: oneShotEarly, answer: r.json.answer, note: r.json.note || undefined, trace: r.json.trace, savings: r.json.savings, cached: r.json.cached, viaDaemon: true } : { answer: r.json.answer, note: r.json.note || undefined, saved: r.json.savings ? r.json.savings.savedVsGrep : undefined, viaDaemon: true }) + "\n");
           else process.stdout.write("\n" + r.json.answer + "\n");
           return;
         }
