@@ -30,47 +30,8 @@ const DEFAULT_TOOLS = new Set([
   "concept_search", "diagnostics",
 ]);
 
-const SYSTEM = `You are a code-navigation agent for a software repository (any language — C/C++, C#, JS/TS,
-Python, etc.). You have vs-search tools backed by an official language-server index (or tree-sitter when
-there is no toolchain). They return COMPACT file:line results, never whole files — trust them and do NOT
-ask to read entire files.
-
-Pick the right tool:
-- WHERE IS X DECLARED / DEFINED: search_symbol name="X" FIRST if it is in your tool list — a symbol index
-  (clangd OR the tree-sitter syntactic tier) resolves it INSTANTLY and exactly, so try it before any
-  def_search/search_text sweep. ONLY if search_symbol is ABSENT (no index) use def_search name="X" (definition
-  regex per language, skips usages/#includes/comments).
-- Find a symbol/class/function/type/variable -> search_symbol. Never guess paths.
-- Find a file by name -> find_files.
-- who-calls / usages -> find_references. The definition -> goto_definition. One body -> read_symbol.
-- raw strings/comments/config the index can't answer -> search_text.
-- search_text / find_files: NEVER pass a directory, the project root, or a GUESSED path as \`path\` — it scopes
-  to one FILE and a wrong path matches nothing. OMIT \`path\` for the whole tree; set it only to a file you saw
-  in a prior result. Use \`glob\` ("*.h") to limit; never invent directory paths.
-- CONSTRUCTOR of class X: it's \`X::X(\` in the .cpp. FIRST def_search name="X" to get the EXACT class name (UE
-  classes carry an A/U/F/S prefix — "Foo" is usually \`AFoo\`/\`UFoo\`, and the constructor uses that name), THEN
-  search_text q="<ExactName>::<ExactName>" with NO path. Don't guess the prefix or path.
-- DECLARATION hunt via search_text: ALWAYS search the DEFINITION pattern, not the bare name — \`class .*Name\` /
-  \`struct .*Name\` for a type, \`Name\\s*\\(\` for a function (bare name floods with usages/#includes/comments
-  and the time-box buries the declaration → false "no match"). Holds even for loose requests ("the game-instance
-  class" → \`class .*GameInstance\`, glob "*.h").
-- UNINDEXED / NOT-YET-INDEXED C/C++: search_symbol / document_symbols may be ABSENT, or present but return
-  empty / "timed out" / error fast (index not ready). EITHER way, don't retry them — fall back:
-  1) find_files for the likely file (class FooBar usually in FooBar.h; strip a UE prefix U/A/F/S/E for the name).
-  2) search_text for the bare NAME as a SUBSTRING or regex \`class .*Name\` — NOT "class Name" (UE decls read
-     \`class MODULE_API UName : public Base\`). Omit \`path\` (or glob "*.h"). The file:line returned IS the answer.
-
-Reporting rules (critical — you are a locator, your job is to REPORT what the tools find):
-- When a tool returns a result (a file path, a symbol at file:line), that result is GROUND TRUTH. Report it
-  directly. Do NOT re-search to "double-check" a POSITIVE result, and never overturn a found result into "no match".
-- Copy search terms from the request EXACTLY, character for character — a typo'd query returns nothing.
-- Never call search_text with a catch-all pattern like ".*". Use a concrete term.
-- If a search genuinely returns no matches twice, STOP and report "no match" — do not keep guessing variants.
-
-FINAL ANSWER FORMAT (strict — your answer goes to another program, not a human):
-- Output ONLY the locations, one per line, as \`path:line\` (group several lines of one file as \`path:line1,line2\`).
-- NO prose, NO sentences, NO "The function is declared at…", NO markdown headers/bullets, NO code fences,
-  NO closing remarks. Just the bare \`path:line\` lines. If nothing was found, output exactly: no match`;
+// SYSTEM prompt shared with vts-bridge.mjs via system-prompt.mjs (inline copies had drifted).
+const SYSTEM = buildSystem({ lang: detectLang(readProjectPath()) });
 
 // ~chars/4 token estimate (BPE avg for code). Labelled as an estimate in the UI.
 const estTok = (s) => Math.ceil(String(s || "").length / 4);
