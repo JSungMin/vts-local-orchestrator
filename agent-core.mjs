@@ -80,7 +80,7 @@ const ROOT_ARGS = ["projectPath", "root", "cwd"];
 // When ONLY the split-root cluster has a syntactic symbol index, route symbol queries to it (engine symbols
 // resolve even when scoped to the game sub-project). createAgent sets this. Mirrors vts-bridge.mjs.
 let SYMBOL_ROOT_OVERRIDE = null;
-const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols"]);
+const SYMBOL_INDEX_TOOLS = new Set(["search_symbol", "document_symbols", "find_references"]); // find_references: the server (vts ≥0.42.7) answers it from the committed index + decl-file usage scan on crawl-risk trees, so it needs the CLUSTER root too — scoped to the game sub-project it can't see an engine-side symbol at all (live: who-calls dead-ended while the decl+callers sat one level up).
 function injectProject(toolSchema, args, project) {
   if (!project) return args;
   const props = toolSchema?.inputSchema?.properties || {};
