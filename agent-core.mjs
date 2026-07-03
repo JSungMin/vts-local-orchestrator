@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadConfig, clangdIndexUsable, clangdIndexState, dynamicTextTimebox, hasSyntacticIndex } from "./config-loader.mjs";
 import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
+import { buildSystem } from "./system-prompt.mjs";
 import { logActivity } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
 
