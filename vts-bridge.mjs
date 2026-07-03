@@ -152,12 +152,11 @@ function relAnswer(s) {
   // answer's paths are forward-slash (vs-search normalises them), so a raw split never matched and the long
   // absolute project prefix was left on every line — bloating the answer and echoing the full on-disk path.
   const p = PROJECT.replace(/\\/g, "/").replace(/\/+$/, "");
-  return String(s)
-    .replace(/\\/g, "/")
-    .split(p + "/")
-    .join("")
-    .split(p)
-    .join("");
+  // Case-INSENSITIVE strip: on Windows, tsserver hands back a lowercase drive (`g:/…`) while `-p` is `G:\…`,
+  // so an exact split missed the prefix and left the whole absolute path on every line (bloat + on-disk path
+  // echoed). A case-insensitive regex strips it regardless of drive/segment case; the remainder keeps its case.
+  const esc = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return String(s).replace(/\\/g, "/").replace(new RegExp(esc + "/?", "gi"), "");
 }
 
 // ANTI-FABRICATION GUARD v2. v1 only checked that the PATH string appeared somewhere in the run's tool
@@ -1065,7 +1064,10 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
       if (txt && !isEmpty(txt)) {
         messages[messages.length - 1].content +=
           `\n\n[pre-resolved] find_files("${fileMention[1]}") already ran; result:\n${txt.slice(0, 600)}\n` +
-          `Scope your search to that file (search_text q="<term>" path="<the path above>", or document_symbols on it) instead of scanning the whole tree.`;
+          `If the task only asks WHERE this file is, that path IS the answer — report it directly as your final ` +
+          `answer and do NOT search further (never reply "no match"; the file was found). If it asks to find ` +
+          `something INSIDE the file, scope to it (search_text q="<term>" path="<the path above>", or ` +
+          `document_symbols on it) instead of scanning the whole tree.`;
         prog({ kind: "tool", tool: "find_files", args: ffArgs, pre: true });
       }
     } catch { /* pre-step is best-effort — the normal loop proceeds without it */ }
@@ -1384,7 +1386,11 @@ async function main() {
   }
 
   // Reading-delegation subcommands — local model only, NO vs-search server needed.
-  const rawArgs = process.argv.slice(2);
+  // Strip `-p <repo>` / `--project <repo>` FIRST so the subcommand is detected even when the project flag
+  // precedes it: the delegation skill tells the agent to "always pass -p", so `qvts -p <repo> digest <file>`
+  // is a normal invocation — but with the raw argv, sub would be "-p" and digest/triage/vcs silently fell
+  // through to a locate ("no match" on the file name). stripProjectArgs also cleans the per-subcommand args.
+  const rawArgs = stripProjectArgs(process.argv.slice(2));
   const sub = rawArgs[0];
   // NOTE: the qvts.sh wrapper consumes --json into QVTS_JSON env, so check both.
   const wantJson = process.argv.includes("--json") || /^(1|true|on|yes)$/i.test(process.env.QVTS_JSON || "");
@@ -2111,6 +2117,19 @@ async function main() {
     // this fires, with no forced exit and thus no double-close.
     setTimeout(() => process.exit(0), Number(process.env.QVTS_EXIT_NET_MS || 5000)).unref?.();
     return; // do NOT fall through to the REPL; the closed-client loop drains and the process exits 0
+  }
+
+  // An empty query on a NON-interactive invocation must not fall into the readline REPL — it would block
+  // forever waiting on stdin that never arrives, so an automated caller (e.g. `qvts --json "  "`, a whitespace
+  // task) HANGS instead of getting a result. Only a genuine interactive TTY gets the REPL; otherwise emit a
+  // clear "no query" result and exit.
+  if (process.env.QVTS_JSON === "1" || !process.stdin.isTTY) {
+    const msg = 'no query given — usage: qvts [-p <repo>] "<locate task>", or a subcommand (digest <file>, triage-diff, …)';
+    if (process.env.QVTS_JSON === "1") process.stdout.write(JSON.stringify({ answer: "no match", note: msg }) + "\n");
+    else process.stderr.write(msg + "\n");
+    await client.close().catch(() => {});
+    setTimeout(() => process.exit(2), Number(process.env.QVTS_EXIT_NET_MS || 5000)).unref?.();
+    return;
   }
 
   // REPL
