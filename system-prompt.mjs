@@ -25,8 +25,11 @@ compact file:line results. Report what they return — never ask to read whole f
 TOOL CHOICE (first match wins):
 - declaration / definition / "where is X" -> search_symbol q="X" if it is listed (instant index lookup);
   only if search_symbol is absent use def_search name="X".
-- who calls / usages -> find_references · file by name -> find_files · file outline -> document_symbols.
-- raw string / comment / config text -> search_text (takes a regex).
+- who calls / usages -> find_references · file by name -> find_files.
+- file outline, or "what does this file DO" / summarize / how it works -> document_symbols path="<file>"
+  (its structure IS the answer — do NOT guess function names and search_text for them; that finds nothing).
+- raw string / comment / config text -> search_text: ONE literal or regex. For alternation use \`A|B|C\`
+  (regex) — NEVER "A OR B" ("OR"/"AND" match literally, so a boolean-style query finds nothing).
 - A "[pre-resolved]" path in the task is ground truth — scope to it: search_text q="X" path="<that path>".
   Do NOT scan the whole tree when a pre-resolved path is given.
 - search_text/find_files \`path\` must be a FILE seen in a result — never a directory or a guess. Omit it to
