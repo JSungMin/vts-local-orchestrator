@@ -44,6 +44,8 @@ const VTS_SERVER = CFG.vtsServer;
 const MAX_STEPS = CFG.maxSteps;
 const NUM_CTX = CFG.numCtx;
 const KEEP_ALIVE = process.env.QVTS_KEEP_ALIVE || "30m"; // keep the model resident between calls (perf)
+const ANSWER_RESERVE = Number(process.env.QVTS_ANSWER_RESERVE || 2048); // ctx tokens kept free for the final answer
+const CTX_KEEP_RECENT = Number(process.env.QVTS_CTX_KEEP_RECENT || 4);  // most-recent tool results kept in full
 
 // ---- resolve the target project root (so we can inject it into tool args Qwen forgets) ----
 // `-p` / `--project` from argv. The SKILL + route-steer tell the agent to pass `qvts -p "<repo>"`, but the
@@ -762,6 +764,32 @@ async function preflightOllama() {
   }
 }
 
+// Keep the accumulated agent history inside the LOCAL model's context window, reserving room for the final
+// answer. Without this, a multi-symbol task (e.g. 14 find_references) piles up tool results until the prompt
+// approaches num_ctx and the model's final answer is STARVED — it gets cut off mid-token (the qvts JSON stays
+// valid, but its `answer` value is truncated). Keep system + task + the most-recent CTX_KEEP_RECENT tool
+// results in full and compact OLDER tool results to a short stub, so the prompt always leaves >= ANSWER_RESERVE
+// tokens (plus the tools schema) for the reply. Pairing-safe: only tool-role CONTENT is shortened, never
+// removed, so every assistant tool_call keeps its matching tool result.
+function fitContext(messages, tools) {
+  const toolsTok = estTok(JSON.stringify(tools || []));
+  const budget = Math.max(2000, NUM_CTX - ANSWER_RESERVE - toolsTok);
+  let total = messages.reduce((n, m) => n + estTok(m.content || "") + 8, 0);
+  if (total <= budget) return messages;
+  const out = messages.map((m) => ({ ...m }));
+  const toolIdx = out.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
+  const STUB = " …[older result elided to fit the local context window; rely on the results still shown and give your FINAL answer]";
+  for (let k = 0; k < toolIdx.length - CTX_KEEP_RECENT && total > budget; k++) {
+    const i = toolIdx[k];
+    const cur = out[i].content || "";
+    if (cur.length <= 200) continue;
+    const before = estTok(cur);
+    out[i] = { ...out[i], content: cur.slice(0, 200) + STUB };
+    total -= before - estTok(out[i].content);
+  }
+  return out;
+}
+
 async function ollamaChat(messages, tools) {
   const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
     method: "POST",
@@ -769,7 +797,7 @@ async function ollamaChat(messages, tools) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: MODEL,
-      messages,
+      messages: fitContext(messages, tools),
       tools,
       stream: false,
       keep_alive: KEEP_ALIVE,
