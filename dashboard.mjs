@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { createAgent } from "./agent-core.mjs";
 import { loadConfig } from "./config-loader.mjs";
-import { readActivity, ACTIVITY_FILE, readLive, LIVE_FILE } from "./activity-log.mjs";
+import { readActivity, clearActivity, ACTIVITY_FILE, readLive, LIVE_FILE } from "./activity-log.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = loadConfig().port;
@@ -108,6 +108,31 @@ const HTML = String.raw`<!doctype html>
   .badge.dash{color:var(--acc);border-color:var(--acc)} .badge.cli{color:var(--ok);border-color:var(--ok)}
   .badge.daemon{color:var(--warn);border-color:var(--warn)} .badge.hook{color:var(--tool);border-color:var(--tool)}
   .badge.cache{color:var(--warn)} .save{color:var(--ok);margin-left:auto}
+  /* activity: flat recent-first history + search */
+  #actbar{display:none;margin-bottom:10px;gap:8px}
+  #actbar.on{display:flex}
+  #actSearch{flex:1;background:var(--panel);border:1px solid var(--bd);color:var(--fg);padding:8px 11px;border-radius:6px;font:inherit}
+  #actSearch:focus{outline:0;border-color:var(--acc)}
+  #actClear{background:transparent;border:1px solid var(--bd);color:var(--mut);font-weight:600;padding:8px 12px;border-radius:6px;cursor:pointer}
+  #actClear:hover{border-color:var(--bad);color:var(--bad)}
+  .arow{border:1px solid var(--bd);border-radius:8px;margin:6px 0;background:var(--panel);padding:7px 10px}
+  .arow .atop{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:12px;flex-wrap:wrap}
+  .arow .atime{color:var(--fg);font-weight:600} .arow .akind{color:var(--tool);font-weight:600}
+  .arow .atask{color:var(--fg);font-weight:600;margin-top:3px;white-space:pre-wrap;word-break:break-word}
+  .arow .ares{color:var(--mut);margin-top:2px;white-space:pre-wrap;word-break:break-word}
+  .arow .atools{margin-top:2px}
+  mark{background:var(--warn);color:#0d1117;border-radius:2px;padding:0 1px}
+  /* live-run success: token-saved overlay */
+  #ovl{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;z-index:50}
+  #ovl.show{animation:ovlfade 2.8s ease-out forwards}
+  @keyframes ovlfade{0%{opacity:0}10%{opacity:1}80%{opacity:1}100%{opacity:0}}
+  .ovlcard{background:linear-gradient(135deg,#1b6b3a,#3fb950);color:#04150a;padding:24px 44px;border-radius:18px;
+    box-shadow:0 16px 70px rgba(63,185,80,.55),0 0 0 1px rgba(63,185,80,.4);text-align:center}
+  #ovl.show .ovlcard{animation:ovlpop 2.8s cubic-bezier(.2,1.35,.35,1) forwards}
+  @keyframes ovlpop{0%{transform:scale(.55)}12%{transform:scale(1.1)}22%{transform:scale(1)}100%{transform:scale(1)}}
+  .ovlcard .ovltag{font-size:14px;font-weight:800;letter-spacing:.04em;opacity:.85}
+  .ovlcard .big{font-size:46px;font-weight:800;letter-spacing:-.02em;line-height:1.1;margin:2px 0}
+  .ovlcard .sub{font-size:13px;font-weight:600;opacity:.8}
 </style></head><body>
 <header>
   <span><span class="dot" id="dot"></span><b id="hmodel">local LLM</b> <span style="color:var(--mut)">↔ vts</span> live</span>
@@ -121,6 +146,7 @@ const HTML = String.raw`<!doctype html>
       <button class="tab on" data-t="live">Live run</button>
       <button class="tab" data-t="act">Activity — 모든 qvts <span class="pill" id="actCount"></span></button>
     </div>
+    <div id="actbar"><input type="text" id="actSearch" placeholder="🔍 검색: task · 결과 · 프로젝트 · kind · via (최근순)" autocomplete="off"><button id="actClear" title="로컬 활동 히스토리 전체 삭제">🗑 비우기</button></div>
     <div id="live"></div>
     <div id="log"></div>
     <div id="tree" style="display:none"></div>
@@ -153,6 +179,7 @@ const HTML = String.raw`<!doctype html>
     <pre class="ps" id="ps">–</pre>
   </aside>
 </div>
+<div id="ovl"><div class="ovlcard"><div class="ovltag">🎉 토큰 절약</div><div class="big" id="ovlbig">0</div><div class="sub" id="ovlsub">tokens saved vs grep</div></div></div>
 <script>
 const log=document.getElementById('log'),dot=document.getElementById('dot');
 let curThink=null,tcCount=0;
@@ -174,7 +201,7 @@ es.onmessage=e=>{const ev=JSON.parse(e.data);
   else if(ev.type==='tool_call'){tcCount++;set('tc',tcCount);
     const head=[mk('span','', (ev.dup?'🔁 ':'🔧 ')+ev.tool)];el(ev.dup?'tool':'tool',head,JSON.stringify(ev.args,null,1));}
   else if(ev.type==='tool_result'){el('res'+(ev.ok?'':' bad'),(ev.ok?'✅ ':'⚠️ ')+ev.tool,ev.text.slice(0,1500));}
-  else if(ev.type==='final'){dot.className='dot on';set('st','done');applyStats(ev.stats);el('final','🟢 final answer',ev.answer);}
+  else if(ev.type==='final'){dot.className='dot on';set('st','done');applyStats(ev.stats);el('final','🟢 final answer',ev.answer);showSaveOverlay(ev.stats);}
   else if(ev.type==='stopped'){dot.className='dot on';set('st','stopped');applyStats(ev.stats);el('stop','🟡 stopped: '+ev.reason,'');}
   else if(ev.type==='ps'){document.getElementById('ps').textContent=ev.text;}
   else if(ev.type==='activity-changed'){loadActivity();}
@@ -188,6 +215,19 @@ function applyStats(s){if(!s)return;if(s.tokPerSec)set('tps',s.tokPerSec);if(s.m
     set('sv',fmt(v.savedVsVts)+pct(v.savedVsVts,v.ccVtsTok));set('sg',fmt(v.savedVsGrep)+pct(v.savedVsGrep,v.ccGrepTok));
     cumV+=v.savedVsVts;cumG+=v.savedVsGrep;set('cv',fmt(cumV));set('cg',fmt(cumG));}}
 function mk(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x)e.textContent=x;return e;}
+// Live-run success flourish: when a dashboard run finishes and beat raw grep, pop a center-screen count-up.
+function showSaveOverlay(s){
+  const v=s&&s.savings;if(!v)return;
+  const saved=v.savedVsGrep||0;if(saved<=0)return;
+  const ovl=document.getElementById('ovl'),big=document.getElementById('ovlbig'),sub=document.getElementById('ovlsub');
+  const pctG=v.ccGrepTok>0?Math.round(saved/v.ccGrepTok*100):0;
+  sub.textContent='tokens saved vs grep'+(pctG?' · '+pctG+'% 절감':'');
+  ovl.classList.remove('show');void ovl.offsetWidth; // restart the CSS animation
+  ovl.classList.add('show');
+  const dur=1200,t0=performance.now();
+  (function step(t){const k=Math.min(1,(t-t0)/dur),e=1-Math.pow(1-k,3);
+    big.textContent=fmt(Math.round(saved*e));if(k<1)requestAnimationFrame(step);})(t0);
+}
 document.getElementById('f').addEventListener('submit',async e=>{e.preventDefault();
   const q=document.getElementById('q').value.trim();if(!q)return;
   document.getElementById('go').disabled=true;
@@ -210,6 +250,7 @@ tabs.forEach(t=>t.addEventListener('click',()=>{
   tabs.forEach(x=>x.classList.remove('on'));t.classList.add('on');
   const act=t.dataset.t==='act';
   document.getElementById('tree').style.display=act?'block':'none';
+  document.getElementById('actbar').style.display=act?'flex':'none';
   document.getElementById('log').style.display=act?'none':'block';
   document.getElementById('live').style.display=act?'none':'block';
   if(act)loadActivity();else loadLive();
@@ -217,51 +258,45 @@ tabs.forEach(t=>t.addEventListener('click',()=>{
 const KIND_ICON={locate:'🧭',def_search:'🎯',digest:'📑',['digest-dir']:'📚',triage:'🩺',web:'🌐'};
 const short=p=>{if(!p)return '(no project)';const s=p.replace(/[\\/]+$/,'').split(/[\\/]/);return s.slice(-2).join('/');};
 function hhmmss(ts){try{return new Date(ts).toLocaleTimeString();}catch{return '';}}
-function renderActivity(items){
+let _activityItems=[]; // last fetch, re-filtered client-side by the search box without a refetch
+// Flat, NEWEST-FIRST history (the tree buried recency behind alpha-sorted project/kind groups). A search box
+// filters across task/result/project/kind/via, and matches are highlighted — so old records are findable.
+function renderActivity(){
   const tree=document.getElementById('tree');
+  const items=_activityItems;
   document.getElementById('actCount').textContent=items.length;
-  if(!items.length){tree.innerHTML='<div class="pill" style="padding:10px">아직 활동 없음 — qvts가 (대시보드/CLI/위임/hook 어디서든) 일하면 여기 쌓입니다.</div>';return;}
-  // group: project → kind → runs
-  const byProj={};
-  for(const a of items){const p=a.project||'(no project)';(byProj[p]=byProj[p]||{});const k=a.kind||'?';(byProj[p][k]=byProj[p][k]||[]).push(a);}
-  // preserve open/closed state across refreshes
-  const openState={};tree.querySelectorAll('details').forEach(d=>{if(d.dataset.key)openState[d.dataset.key]=d.open;});
-  tree.innerHTML='';
-  for(const p of Object.keys(byProj).sort()){
-    const kinds=byProj[p];const pTot=Object.values(kinds).reduce((n,a)=>n+a.length,0);
-    const pSave=Object.values(kinds).flat().reduce((n,a)=>n+((a.savings&&a.savings.savedVsGrep)||0),0);
-    const pd=document.createElement('details');pd.className='grp';pd.dataset.key='p:'+p;pd.open=openState['p:'+p]!==false;
-    const ps=document.createElement('summary');ps.innerHTML='<b>'+esc(short(p))+'</b> <span class="pill">'+pTot+' runs · ~'+fmt(pSave)+' tok saved</span>';
-    pd.appendChild(ps);
-    for(const k of Object.keys(kinds).sort()){
-      const runs=kinds[k].slice().reverse();
-      const kSave=runs.reduce((n,a)=>n+((a.savings&&a.savings.savedVsGrep)||0),0);
-      const kd=document.createElement('details');kd.className='kind';kd.dataset.key='k:'+p+'/'+k;kd.open=!!openState['k:'+p+'/'+k];
-      const ks=document.createElement('summary');ks.innerHTML=(KIND_ICON[k]||'•')+' '+esc(k)+' <span class="pill">'+runs.length+' · ~'+fmt(kSave)+' saved</span>';
-      kd.appendChild(ks);
-      const box=document.createElement('div');box.className='runs';
-      for(const a of runs){
-        const r=document.createElement('div');r.className='run';
-        const via=a.via||'cli';const sg=(a.savings&&a.savings.savedVsGrep)||0;
-        const top=document.createElement('div');top.className='top';
-        top.innerHTML='<span>'+hhmmss(a.ts)+'</span>'
-          +'<span class="badge '+via+'">'+via+'</span>'
-          +(a.cached?'<span class="badge cache">cache</span>':'')
-          +(a.ms!=null?'<span>'+(a.ms/1000).toFixed(1)+'s</span>':'')
-          +(sg?'<span class="save">↓'+fmt(sg)+' tok</span>':'');
-        const task=document.createElement('div');task.className='task';task.textContent=a.task||'';
-        const res=document.createElement('div');res.className='res';res.textContent=(a.result||'').slice(0,300);
-        r.appendChild(top);r.appendChild(task);if(a.result)r.appendChild(res);
-        if(a.tools&&a.tools.length){const tl=document.createElement('div');tl.className='pill';tl.textContent=a.tools.join(' → ');r.appendChild(tl);}
-        box.appendChild(r);
-      }
-      kd.appendChild(box);pd.appendChild(kd);
-    }
-    tree.appendChild(pd);
-  }
+  const term=(document.getElementById('actSearch').value||'').trim().toLowerCase();
+  let rows=items.slice().reverse(); // file is oldest→newest; show newest first
+  if(term)rows=rows.filter(a=>((a.task||'')+' '+(a.result||'')+' '+(a.project||'')+' '+(a.kind||'')+' '+(a.via||'')).toLowerCase().includes(term));
+  if(!rows.length){tree.innerHTML='<div class="pill" style="padding:10px">'+(term?'검색 결과 없음: “'+esc(term)+'”':'아직 활동 없음 — qvts가 (대시보드/CLI/위임/hook 어디서든) 일하면 여기 쌓입니다.')+'</div>';return;}
+  const hl=s=>{const e=esc(s==null?'':String(s));if(!term)return e;
+    const i=e.toLowerCase().indexOf(term);return i<0?e:e.slice(0,i)+'<mark>'+e.slice(i,i+term.length)+'</mark>'+e.slice(i+term.length);};
+  tree.innerHTML=rows.map(a=>{
+    const via=a.via||'cli';const sg=(a.savings&&a.savings.savedVsGrep)||0;
+    return '<div class="arow"><div class="atop">'
+      +'<span class="atime">'+hhmmss(a.ts)+'</span>'
+      +'<span class="akind">'+(KIND_ICON[a.kind]||'•')+' '+hl(a.kind||'?')+'</span>'
+      +'<span class="badge '+via+'">'+esc(via)+'</span>'
+      +'<span class="pill">'+hl(short(a.project))+'</span>'
+      +(a.cached?'<span class="badge cache">cache</span>':'')
+      +(a.ms!=null?'<span>'+(a.ms/1000).toFixed(1)+'s</span>':'')
+      +(sg?'<span class="save">↓'+fmt(sg)+' tok</span>':'')
+      +'</div>'
+      +'<div class="atask">'+hl(a.task||'')+'</div>'
+      +(a.result?'<div class="ares">'+hl((a.result||'').slice(0,300))+'</div>':'')
+      +(a.tools&&a.tools.length?'<div class="pill atools">'+esc(a.tools.join(' → '))+'</div>':'')
+      +'</div>';
+  }).join('');
 }
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
-async function loadActivity(){try{const j=await (await fetch('/activity?limit=800')).json();renderActivity(j);}catch{}}
+async function loadActivity(){try{_activityItems=await (await fetch('/activity?limit=3000')).json();renderActivity();}catch{}}
+document.getElementById('actSearch').addEventListener('input',renderActivity);
+document.getElementById('actClear').addEventListener('click',async()=>{
+  const n=_activityItems.length;
+  if(!confirm('로컬 활동 히스토리 '+n+'건을 모두 삭제합니다. 되돌릴 수 없습니다. 계속할까요?'))return;
+  try{await fetch('/activity/clear',{method:'POST'});document.getElementById('actSearch').value='';loadActivity();}
+  catch(e){alert('삭제 실패: '+e.message);}
+});
 loadActivity();
 
 // ---- Live progress from ALL entry points (CLI / Claude delegation / daemon), via the live channel ----
@@ -329,6 +364,13 @@ const server = http.createServer(async (req, res) => {
     const limit = Math.min(400, Math.max(1, Number(new URLSearchParams(q).get("limit")) || 200));
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     return res.end(JSON.stringify(readLive(limit)));
+  }
+  if (url === "/activity/clear" && req.method === "POST") {
+    // Wipe the local activity history at the user's request (from the dashboard's 🗑 button). Local-only.
+    const ok = clearActivity();
+    broadcast({ type: "activity-changed" });
+    res.writeHead(ok ? 200 : 500, { "content-type": "application/json", "cache-control": "no-store" });
+    return res.end(JSON.stringify({ ok }));
   }
   if (url === "/activity") {
     // The shared activity bus — every qvts unit of work (locate/def_search/digest/digest-dir/triage/web)

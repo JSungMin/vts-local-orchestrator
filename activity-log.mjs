@@ -192,6 +192,18 @@ export function pruneLiveRuns(drop) {
   } catch { return 0; }
 }
 
+// Wipe the activity history (truncate the file to empty). Local-only, user-initiated from the dashboard.
+// Best-effort: returns false if the file couldn't be truncated. Does NOT touch the live channel.
+export function clearActivity() {
+  try {
+    fs.mkdirSync(path.dirname(ACTIVITY_FILE), { recursive: true });
+    fs.writeFileSync(ACTIVITY_FILE, "");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Read the most recent `limit` activity records (oldest→newest). Bounded read for the dashboard.
 export function readActivity(limit = 500) {
   try {
