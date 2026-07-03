@@ -47,6 +47,19 @@ const KEEP_ALIVE = process.env.QVTS_KEEP_ALIVE || "30m"; // keep the model resid
 const ANSWER_RESERVE = Number(process.env.QVTS_ANSWER_RESERVE || 2048); // ctx tokens kept free for the final answer
 const CTX_KEEP_RECENT = Number(process.env.QVTS_CTX_KEEP_RECENT || 4);  // most-recent tool results kept in full
 
+// Orphan guard. The vs-search server we spawn is a CHILD process (which itself may hold a clangd). On the
+// graceful paths client.close() tears it down, but a process.exit() race, an uncaught throw, or a SIGTERM from
+// `timeout` skips that — and the server lingers forever (observed: piles of stale server/clangd procs whose
+// parent qvts had long since exited). Kill the child SYNCHRONOUSLY from an 'exit' handler (fires on every exit
+// except an uncatchable SIGKILL of US), and route SIGTERM/SIGINT through process.exit so the handler runs.
+let _serverPid = null, _daemonFile = null;
+process.on("exit", () => {
+  if (_serverPid) { try { process.kill(_serverPid, "SIGKILL"); } catch { /* already gone */ } }
+  if (_daemonFile) { try { fs.rmSync(_daemonFile); } catch { /* ignore */ } }
+});
+process.on("SIGTERM", () => process.exit(143));
+process.on("SIGINT", () => process.exit(130));
+
 // ---- resolve the target project root (so we can inject it into tool args Qwen forgets) ----
 // `-p` / `--project` from argv. The SKILL + route-steer tell the agent to pass `qvts -p "<repo>"`, but the
 // npm-global `qvts` shim forwards EVERY arg straight to this bridge (it doesn't translate -p → VTS_PROJECT
@@ -1804,7 +1817,7 @@ async function main() {
     // Stamp the spawned vs-search server pid into every live event so `qvts reap` can kill THIS run's
     // orphaned server/clangd if the owning qvts process is later SIGKILLed (the zombie case). Best-effort —
     // the SDK exposes the child pid as transport.pid (fallback to the internal _process.pid on older SDKs).
-    try { const sp = transport.pid ?? transport._process?.pid; if (sp) setLiveExtra({ server: sp }); } catch { /* optional */ }
+    try { const sp = transport.pid ?? transport._process?.pid; if (sp) { setLiveExtra({ server: sp }); _serverPid = sp; } } catch { /* optional */ }
   } catch (e) {
     throw new Error(
       `the vs-search server failed to start (${e.message}).\n` +
@@ -1969,6 +1982,7 @@ async function main() {
       try {
         fs.mkdirSync(path.dirname(DAEMON_FILE), { recursive: true });
         fs.writeFileSync(DAEMON_FILE, JSON.stringify({ pid: process.pid, port: DAEMON_PORT, project: PROJECT || null }));
+        _daemonFile = DAEMON_FILE; // let the global exit handler remove it if a signal short-circuits cleanup
       } catch {
         /* ignore */
       }

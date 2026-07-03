@@ -471,6 +471,11 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   });
   const client = new Client({ name: "vts-local-dashboard", version: "0.1.0" }, { capabilities: {} });
   await client.connect(transport);
+  // Orphan guard: the vs-search server is a CHILD process. close() tears it down on the graceful path (the
+  // dashboard's SIGINT/SIGTERM handler calls it); this 'exit' handler covers a crash / uncaught throw so the
+  // server (and its clangd) doesn't linger after the dashboard dies. (An uncatchable SIGKILL is handled server-
+  // side by exiting on stdin EOF.)
+  try { const sp = transport.pid ?? transport._process?.pid; if (sp) process.on("exit", () => { try { process.kill(sp, "SIGKILL"); } catch { /* already gone */ } }); } catch { /* optional */ }
 
   const allTools = (await client.listTools()).tools;
   const tools = allTools.filter((t) => allowed.has(t.name));
