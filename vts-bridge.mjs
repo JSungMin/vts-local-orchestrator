@@ -148,8 +148,12 @@ const WIDER_ROOT = widenRoot(PROJECT);
 // PROJECT reflects the -p / VTS_PROJECT target. No-op when PROJECT is unset.
 function relAnswer(s) {
   if (!PROJECT) return s;
-  const p = PROJECT.replace(/\/+$/, "");
+  // Normalise separators on BOTH sides before stripping: `-p` arrives with OS separators (Windows `\`) but the
+  // answer's paths are forward-slash (vs-search normalises them), so a raw split never matched and the long
+  // absolute project prefix was left on every line — bloating the answer and echoing the full on-disk path.
+  const p = PROJECT.replace(/\\/g, "/").replace(/\/+$/, "");
   return String(s)
+    .replace(/\\/g, "/")
     .split(p + "/")
     .join("")
     .split(p)
@@ -188,6 +192,26 @@ function verifyAnswerPaths(raw, results) {
     return `${m[1].trim()}:${verified.join(",")}`;
   }).filter((x) => x !== null);
   return { raw: kept.join("\n").trim(), droppedPaths, droppedLines };
+}
+
+// Small local models often ignore the compact `path:line` contract and instead echo the tool-result line
+// VERBATIM as markdown — `* path:214: <the whole source line>` under a `**Symbol**` header. That form is
+// heavy (source text + long paths repeated per hit) and, because it does NOT end at the line number, it slips
+// past BOTH verifyAnswerPaths and groupLocLines (each only recognises a line that IS exactly `path:line`), so
+// nothing verifies OR compacts it — a live 7-symbol dump reached ~10.7k chars. Normalise each location line
+// back to bare `path:line(s)`: strip a leading list marker, strip the trailing `: <source text>`, and drop a
+// pure markdown header / bold symbol label. Bare locations, `note:`, `no match`, and prose pass through. Run
+// BEFORE the fabrication guard so those lines become verifiable, and before groupLocLines so they compact.
+function normalizeLocLines(s) {
+  const out = [];
+  for (const ln of String(s).split("\n")) {
+    const t = ln.replace(/^\s*(?:[-*+]|\d+\.)\s+/, "");            // drop a leading markdown list marker
+    if (/^\s*#{1,6}\s/.test(t) || /^\s*\*\*.+\*\*\s*$/.test(t)) continue; // drop a header / bold symbol label
+    const m = /^\s*(.+?):(\d+(?:\s*,\s*\d+)*)\s*(?::.*)?$/.exec(t); // path:nums optionally trailed by ": <text>"
+    if (m && /[/\\.]/.test(m[1])) { out.push(`${m[1].trim()}:${m[2].replace(/\s+/g, "")}`); continue; }
+    out.push(ln);                                                  // not a location line → untouched
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // Compact a final answer's location lines: hits in the same file collapse to `path:l1,l2,l3`. The prompt
@@ -1255,6 +1279,10 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     // and the judgment reaches the orchestrator instead of being discarded.
     const nm = /(?:^|\n)note:\s*(.+)\s*$/i.exec(raw);
     if (nm) { note = nm[1].trim().slice(0, 300); raw = raw.slice(0, nm.index).trim(); }
+    // Normalise a verbose markdown / source-echo answer back to bare `path:line` FIRST — otherwise the
+    // fabrication guard and the grouper below both mistake those lines for prose and skip them (unverified +
+    // uncompacted, the ~10k-char failure mode).
+    raw = normalizeLocLines(raw);
     // Anti-fabrication guard (see verifyAnswerPaths): a small model handed an error result can invent
     // well-formed paths — or attach invented line numbers to real paths. Only tool-verified locations ship.
     {
