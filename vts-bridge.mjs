@@ -179,8 +179,15 @@ function verifyAnswerPaths(raw, results) {
     const m = /^\s*(.+?):(\d+(?:,\d+)*)\s*$/.exec(ln);
     if (!m || !/[/\\.]/.test(m[1])) return ln;             // prose / non-location line → untouched
     const p = m[1].trim().replace(/\\/g, "/").toLowerCase();
-    const tail = p.split("/").slice(-2).join("/");
-    const carriers = blobLines.filter((bl) => bl.includes(p) || (tail && bl.includes(tail)));
+    const segs = p.split("/");
+    const tail = segs.slice(-2).join("/");
+    // Tool output compacts to an `under <dir>` header + BARE `filename:line` data lines. A full-path answer
+    // (the model reconstructs the path from the result header) then matched ONLY the header — which carries NO
+    // line numbers — so every real location was wrongly discarded as fabricated (live: search_text found 7
+    // hits, the guard nuked all 7 → "no match" → the caller abandoned qvts). Also accept a `basename:` data
+    // line as a carrier so the answer's line numbers reconcile against the lines that actually carry them.
+    const base = segs[segs.length - 1];
+    const carriers = blobLines.filter((bl) => bl.includes(p) || (tail && bl.includes(tail)) || (base && bl.includes(base + ":")));
     if (!carriers.length) { droppedPaths++; return null; } // path never appeared in any tool result
     const nums = new Set();
     for (const c of carriers) for (const t of c.match(/\d+/g) || []) nums.add(t);
