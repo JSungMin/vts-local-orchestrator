@@ -1076,6 +1076,33 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
           `something INSIDE the file, scope to it (search_text q="<term>" path="<the path above>", or ` +
           `document_symbols on it) instead of scanning the whole tree.`;
         prog({ kind: "tool", tool: "find_files", args: ffArgs, pre: true });
+        // PRE-SEARCH: resolving the file is not enough for a "find X in FILE" task — the model still has to run
+        // the search, and a small model unreliably does (it may skip the path scope, or FABRICATE file:line it
+        // never saw → the fabrication guard then correctly nukes it → "no match", and the caller abandons qvts).
+        // So do the scoped search HERE: pull the symbol-like tokens out of the task, run ONE search_text
+        // alternation on the resolved file, and hand the model the REAL occurrences to report. Off: QVTS_PRESEARCH=0.
+        if (!/^(0|false|off|no)$/i.test(process.env.QVTS_PRESEARCH || "") && validNames.has("search_text")) {
+          const resolved = (txt.match(/[^\s"']+\.(?:h|hpp|hh|hxx|inl|ipp|tpp|c|cc|cxx|cpp|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|py|pyi)\b/i) || [])[0];
+          const fileBase = fileMention[1].replace(/\.[^.]+$/, "").toLowerCase();
+          const STOP = new Set("find file files report line lines occurrence occurrences each the and for symbol symbols text grep token tokens just number numbers exact where what which this that with from into code function functions class method variable literal string inside every give enclosing block bound builder range".split(" "));
+          const toks = [...new Set((task.match(/[A-Za-z_][A-Za-z0-9_]{3,}/g) || [])
+            .filter((w) => /[A-Z]/.test(w.slice(1)) || w.includes("_"))            // CamelCase / snake_case = symbol-like
+            .filter((w) => w.toLowerCase() !== fileBase && !STOP.has(w.toLowerCase())))].slice(0, 8);
+          if (resolved && toks.length) {
+            try {
+              const stArgs = { q: toks.join("|"), path: resolved, projectPath: PROJECT || undefined };
+              const stOut = await client.callTool({ name: "search_text", arguments: stArgs });
+              const stTxt = (stOut.content || []).map((c) => (c.type === "text" ? c.text : "")).join("\n").trim();
+              trace.push({ tool: "search_text", args: { q: toks.join("|"), path: resolved }, pre: true });
+              if (stTxt && !isEmpty(stTxt)) {
+                messages[messages.length - 1].content +=
+                  `\n\n[pre-searched] search_text for ${toks.join(", ")} in that file already ran; occurrences:\n${stTxt.slice(0, 1500)}\n` +
+                  `These file:line results ARE the answer — report them directly. Do NOT search again and do NOT invent any line not shown above.`;
+                prog({ kind: "tool", tool: "search_text", args: stArgs, pre: true });
+              }
+            } catch { /* pre-search is best-effort — the normal loop still runs */ }
+          }
+        }
       }
     } catch { /* pre-step is best-effort — the normal loop proceeds without it */ }
   }
