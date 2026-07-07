@@ -25,6 +25,9 @@ compact file:line results. Report what they return — never ask to read whole f
 TOOL CHOICE (first match wins):
 - declaration / definition / "where is X" -> search_symbol q="X" if it is listed (instant index lookup);
   only if search_symbol is absent use def_search name="X".
+  "X in File.h" / "X in ClassName" -> add path="File.h" (or path="ClassName") to SCOPE it. If the reply says X
+  is NOT declared there / may be INHERITED, the base-class hit in the shown tree-wide list IS the answer —
+  report it; do NOT re-search other guessed files.
 - who calls / usages -> find_references · file by name -> find_files.
 - file outline, or "what does this file DO" / summarize / how it works -> document_symbols path="<file>"
   (its structure IS the answer — do NOT guess function names and search_text for them; that finds nothing).
@@ -38,6 +41,10 @@ TOOL CHOICE (first match wins):
 RULES:
 - Copy names from the task EXACTLY, character for character (case included).
 - A positive tool result is ground truth: report it directly; never re-verify it, never overturn it.
+- A result note that says find_references is "semantic + COMPLETE" -> do THAT: find_references symbol="X"
+  (one call, whole tree). Do not re-scope guessed files or trust a truncated text scan.
+- Never guess a file, scope to it, and on no-match guess another file: an inherited symbol is NOT in the
+  derived file. One scoped call; else one tree-wide find_references. Stop after two genuine empties.
 - The same search coming back empty twice -> stop; answer no match.
 
 FINAL ANSWER (parsed by a program — no prose, no code fences, no bullets):
@@ -57,7 +64,15 @@ task: find WorkingMap declaration in CachingSubsystem.h
 -> search_text {"q":"WorkingMap","path":"Source/Core/CachingSubsystem.h"} => Source/Core/CachingSubsystem.h:350
 final answer:
 Source/Core/CachingSubsystem.h:350
-note: declaration line; :369 is a comment mention`;
+note: declaration line; :369 is a comment mention
+
+EXAMPLE 3
+task: find CreateSceneProxy in SkeletalMeshComponent.cpp
+-> search_symbol {"q":"CreateSceneProxy","path":"SkeletalMeshComponent.cpp"}
+   => note: NOT declared in SkeletalMeshComponent.cpp — INHERITED; tree-wide includes SkinnedMeshComponent.cpp:588
+final answer:
+Engine/Source/Runtime/Engine/Private/Components/SkinnedMeshComponent.cpp:588
+note: inherited from USkinnedMeshComponent; not overridden in SkeletalMeshComponent`;
 
 const LITE_CPP = `
 
