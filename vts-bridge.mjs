@@ -208,6 +208,18 @@ function verifyAnswerPaths(raw, results) {
 // back to bare `path:line(s)`: strip a leading list marker, strip the trailing `: <source text>`, and drop a
 // pure markdown header / bold symbol label. Bare locations, `note:`, `no match`, and prose pass through. Run
 // BEFORE the fabrication guard so those lines become verifiable, and before groupLocLines so they compact.
+// Strip chat-template CONTROL tokens that occasionally leak into the model's final answer. gemma4-vts uses a
+// channel-style template and a stray `<channel|>` / `<|message|>` slipped through into the answer text (live:
+// "no match<channel|>Source/…"). Match ONLY the known pipe-delimited markers so a legitimate C++ header token
+// like `<vector>` (no pipe) is never touched.
+function stripCtrlTokens(s) {
+  return String(s)
+    .replace(/<\|?(?:channel|message|start|end|im_start|im_end|assistant|user|system|think|tool_call|tool_response|tool)\|?>/gi, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
 function normalizeLocLines(s) {
   const out = [];
   for (const ln of String(s).split("\n")) {
@@ -1309,7 +1321,7 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     const runId = crypto.randomUUID();
     const onProgress = (ev) => logLive({ runId, project: PROJECT, query, ...ev });
     const r = await runAgent(client, tools, ollamaTools, query, history, onProgress);
-    let raw = String(r.answer || "");
+    let raw = stripCtrlTokens(String(r.answer || ""));
     // `note:` escape line (lite prompt): the model's own judgment (uncertainty, stale index, next step)
     // rides as ONE trailing line. Strip it into its own field so the path:line contract stays parseable
     // and the judgment reaches the orchestrator instead of being discarded.
