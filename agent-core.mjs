@@ -504,7 +504,11 @@ export async function createAgent({ onEvent = () => {} } = {}) {
           messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
           continue;
         }
-        const fin = finalize(msg.content || "(no answer)");
+        // Empty final content (model ran a tool then gave no answer — common when a query is too complex for
+        // the small model): salvage the locations already sitting in the tool results instead of shipping a
+        // silent "(no answer)". Only falls back when the model produced no real text of its own.
+        const finalRaw = (msg.content && msg.content.trim()) ? msg.content : (salvageLocs(executed) || "(no answer)");
+        const fin = finalize(finalRaw);
         const ans = fin.answer || "no match";
         const stats = { ms: Date.now() - t0, evalCount: totalEval, tokPerSec: totalEvalMs ? +(totalEval / (totalEvalMs / 1000)).toFixed(1) : 0, steps: step + 1, savings: savings(ans) };
         onEvent({ type: "final", answer: ans, note: fin.note, trace, stats });

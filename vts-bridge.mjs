@@ -954,8 +954,12 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
         messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
         continue;
       }
-      prog({ kind: "final", answer: msg.content || "(no answer)" });
-      return { answer: msg.content || "(no answer)", trace, acct, results: [...executed.values()] };
+      // Empty final content (the model ran a tool then gave no answer — common when a query is too complex
+      // for the small model) → salvage the locations already in the tool results instead of a silent
+      // "(no answer)". Only falls back when the model produced no real text of its own.
+      const finalRaw = (msg.content && msg.content.trim()) ? msg.content : (salvageLocs(executed) || "(no answer)");
+      prog({ kind: "final", answer: finalRaw });
+      return { answer: finalRaw, trace, acct, results: [...executed.values()] };
     }
 
     for (const call of calls) {
