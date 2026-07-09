@@ -949,7 +949,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
       // but survived no parser pass is a MALFORMED EMISSION, not an answer — returning it verbatim ships
       // a raw call string to the caller as the "answer" (live, twice in one day). Give the model a
       // bounded number of corrective retries inside the same run instead.
-      const looksCall = /^\s*([A-Za-z_]\w*)\s*\{/.exec(msg.content || "");
+      const looksCall = /^\s*([A-Za-z_]\w*)\s*:?\s*\{/.exec(msg.content || "");
       if (looksCall && validNames.has(looksCall[1]) && malformedRetries++ < 2) {
         messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
         continue;

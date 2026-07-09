@@ -86,7 +86,10 @@ export function parseToolCallsFromText(content, validNames) {
   // "answer". Per-line so several stacked calls all parse; only exact valid tool names match, so prose is
   // immune. Runs only when no structured call was found, so it can't hijack a legitimate tagged/fenced call.
   for (const line of String(content).split("\n")) {
-    const m = /^\s*([A-Za-z_]\w*)\s*(\{.*\})\s*$/.exec(line);
+    // Accept an optional colon after the tool name: gemma sometimes emits `search_text: {json}` (label form)
+    // in addition to the bare `search_text {json}`. Without the `:?` the colon form parsed as neither a call
+    // nor an answer and leaked the raw call string as the "answer" (live dogfood: `search_text: {"q":"…"}`).
+    const m = /^\s*([A-Za-z_]\w*)\s*:?\s*(\{.*\})\s*$/.exec(line);
     if (!m || !validNames.has(m[1])) continue;
     // gemma emission repair: literal quote tokens (`<|"|>`) leak into the text form, and keys can arrive
     // unquoted (`{symbol:"X"}`). Try strict JSON first, then the artifact-repaired/relaxed form.

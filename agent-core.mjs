@@ -499,7 +499,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
         // Content that LOOKS like a tool call (a valid tool name glued to a brace blob) but survived no parser
         // pass is a MALFORMED emission, not an answer — returning it verbatim ships a raw call string as the
         // "answer". Give bounded corrective retries instead (mirror of vts-bridge's malformedRetries).
-        const looksCall = /^\s*([A-Za-z_]\w*)\s*\{/.exec(msg.content || "");
+        const looksCall = /^\s*([A-Za-z_]\w*)\s*:?\s*\{/.exec(msg.content || "");
         if (looksCall && validNames.has(looksCall[1]) && malformedRetries++ < 2) {
           messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
           continue;
