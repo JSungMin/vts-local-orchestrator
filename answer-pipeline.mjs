@@ -267,7 +267,15 @@ export function finalizeAnswer(rawAnswer, results, project) {
   // `note:` escape line (lite prompt): the model's own judgment rides as ONE trailing line. Peel it into its
   // own field so the path:line contract stays parseable and the judgment still reaches the caller.
   const nm = /(?:^|\n)note:\s*(.+)\s*$/i.exec(raw);
-  if (nm) { note = nm[1].trim().slice(0, 300); raw = raw.slice(0, nm.index).trim(); }
+  if (nm) {
+    const n = nm[1].trim();
+    // gemma pads a `note:` with rambling rationalizations ("…suggesting…, though a direct line-by-line
+    // confirmation was not possible due to tool limitations") that are pure noise to the caller. Drop a note
+    // that is long AND carries a hedge marker; keep a genuinely short judgment (stale index / next step).
+    const hedge = /\b(tool limitation|was not possible|could not|though a direct|suggesting|but did not|not restrict|no direct|unable to)\b/i.test(n);
+    note = (hedge && n.length > 80) ? null : n.slice(0, 160);
+    raw = raw.slice(0, nm.index).trim();
+  }
   raw = normalizeLocLines(raw);
   const v = verifyAnswerPaths(raw, results);
   if (v.droppedPaths || v.droppedLines) {
@@ -277,4 +285,24 @@ export function finalizeAnswer(rawAnswer, results, project) {
   }
   const answer = groupLocLines(relAnswer(raw, project));
   return { answer, note };
+}
+
+// COMPLEX-QUERY GUARD — qvts's local model is a SINGLE-locate driver, not an analyst. A multi-part query
+// ("list line numbers of A, B, C, D + the full body range of E + whether F is applied + where relative to G")
+// makes it run one tool then emit a rambling prose `note:` (or "(no answer)") — noise the caller can't use and
+// wasted tokens. Detect the shape UP FRONT and hand back a decomposition hint instead of running the model.
+// Trips on: >= 3 distinct CamelCase symbol candidates (a 3+-symbol ask is worth decomposing regardless), OR
+// >= 2 symbols together with >= 2 multi-request markers (list / whether / relative to / range / report / does
+// it use). A single- or two-symbol locate never trips (that's exactly what qvts is for).
+export function detectComplexQuery(query) {
+  const q = String(query || "");
+  const syms = [...new Set(q.match(/\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/g) || [])];
+  const markers = (q.match(/\b(list|whether|relative to|the full|body|range|report|does it use)\b/gi) || []).length;
+  const complex = syms.length >= 3 || (syms.length >= 2 && markers >= 2);
+  if (!complex) return { complex: false, symbols: syms };
+  const hint =
+    "(complex multi-part query — qvts's local model does ONE locate, not multi-symbol analysis. Split into a " +
+    "separate call per concept and combine the results yourself: `where is X defined` / `find X in <file>` / " +
+    "`what calls X`. Detected symbols: " + syms.slice(0, 12).join(", ") + (syms.length > 12 ? ", …" : "") + ".)";
+  return { complex: true, symbols: syms, hint };
 }

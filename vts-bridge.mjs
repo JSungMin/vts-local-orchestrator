@@ -38,7 +38,7 @@ import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
 import { findOrphanVtsProcs, killTree } from "./proc-reap.mjs";
 // SHARED answer/tool-call helpers — single source of truth, mirrored into agent-core.mjs (the dashboard path)
 // via the same import so the two never drift again. See answer-pipeline.mjs.
-import { extractJsonBlobs, parseToolCallsFromText, salvageLocs, finalizeAnswer } from "./answer-pipeline.mjs";
+import { extractJsonBlobs, parseToolCallsFromText, salvageLocs, finalizeAnswer, detectComplexQuery } from "./answer-pipeline.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -1133,6 +1133,13 @@ async function locate(client, tools, ollamaTools, query, noCache) {
     ({ answer: out, trace, acct, note = null } = hit);
     cached = true;
     process.stderr.write(`  · [cache hit] ${query}\n`);
+  } else if (detectComplexQuery(query).complex) {
+    // Complex multi-part query → the small model would ramble a prose note or "(no answer)". Skip the model
+    // run entirely and hand back a decomposition hint (see detectComplexQuery); Claude splits it into single
+    // locates. Zero-cost (no model, no tokens) and it never gets cached (not a real answer).
+    out = detectComplexQuery(query).hint;
+    trace = [];
+    acct = { outTok: 0, rawTok: 0, byTool: {} };
   } else {
     const history = [{ role: "system", content: SYSTEM }];
     const runId = crypto.randomUUID();

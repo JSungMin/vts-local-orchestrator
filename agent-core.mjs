@@ -20,7 +20,7 @@ import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
 // SHARED answer/tool-call helpers — single source of truth with vts-bridge.mjs (the CLI path) so the two
 // never drift again. Brings the gemma bare-call parser + the full final-answer pipeline (fabrication guard,
 // control-token strip, normalise, group) the dashboard was previously missing. See answer-pipeline.mjs.
-import { parseToolCallsFromText, salvageLocs, finalizeAnswer } from "./answer-pipeline.mjs";
+import { parseToolCallsFromText, salvageLocs, finalizeAnswer, detectComplexQuery } from "./answer-pipeline.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -614,6 +614,15 @@ export async function createAgent({ onEvent = () => {} } = {}) {
   // Wrap runInner so EVERY dashboard run (final or stopped — all return {answer,trace,stats}) is recorded on
   // the shared activity bus, the same one the CLI/daemon/hook write to, for the dashboard's project>kind>run tree.
   async function run(task) {
+    // Complex multi-part query → the small model would ramble a prose note or "(no answer)". Hand back a
+    // decomposition hint WITHOUT burning a model run; surfaced as the final answer for the dashboard.
+    const cx = detectComplexQuery(task);
+    if (cx.complex) {
+      const stats = { ms: 0, evalCount: 0, steps: 0 };
+      onEvent({ type: "final", answer: cx.hint, trace: [], stats });
+      logActivity({ project, kind: "locate", via: "dashboard", task, result: cx.hint, ms: 0, tools: [] });
+      return { answer: cx.hint, trace: [], stats };
+    }
     const r = await runInner(task);
     const tn = (r.trace || []).map((t) => t.tool);
     logActivity({
