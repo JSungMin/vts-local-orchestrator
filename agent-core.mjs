@@ -56,6 +56,32 @@ function loadRawRatios() {
   }
 }
 
+// SALVAGE (mirror of vts-bridge.mjs) — the small model sometimes loops or hits the step limit AFTER a search
+// already returned real locations (a big "60 match(es) … capped" result it misread as "incomplete", then
+// re-queried into a dead end). Rather than ship a FALSE "no match", recover the largest set of path:line
+// locations already sitting in the tool results and fold it as the answer. Parses the tool output shape
+// `under <dir>/` header + `  <relfile>:<line>: text` rows (search_text/find_files), grouping per file.
+function salvageLocs(executed) {
+  let best = null, bestN = -1;
+  for (const rt of (executed && executed.values ? [...executed.values()] : [])) {
+    const byFile = new Map();
+    let pre = "";
+    for (const ln of String(rt).split("\n")) {
+      const pm = ln.match(/^under (.+?)\/?\s*$/);
+      if (pm) { pre = pm[1].replace(/\\/g, "/"); continue; }
+      const m = ln.match(/^\s*([^\s:][^:]*\.[A-Za-z0-9_]+):(\d+)\b/);
+      if (!m) continue;
+      const file = pre && !m[1].includes("/") ? pre + "/" + m[1] : m[1];
+      if (!byFile.has(file)) byFile.set(file, new Set());
+      byFile.get(file).add(m[2]);
+    }
+    const n = [...byFile.values()].reduce((a, s) => a + s.size, 0);
+    if (n > bestN) { bestN = n; best = byFile; }
+  }
+  if (!best || bestN <= 0) return null;
+  return [...best].map(([f, s]) => `${f}:${[...s].sort((a, b) => Number(a) - Number(b)).join(",")}`).join("\n");
+}
+
 export function readProjectPath() {
   if (process.env.VTS_PROJECT) return process.env.VTS_PROJECT;
   try {
@@ -555,7 +581,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
             resultText = "ALREADY CALLED def_search with these args; give your FINAL answer or try a different name/lang.";
             ok = false;
             if (dupCount >= 3) {
-              const ans = "(stopped: looped on def_search.)";
+              const ans = salvageLocs(executed) || "(stopped: looped on def_search.)";
               const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
               onEvent({ type: "stopped", reason: "looped on def_search", trace, stats });
               return { answer: ans, trace, stats };
@@ -572,7 +598,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
               unproductive++;
               if (unproductive >= 4) {
                 onEvent({ type: "tool_result", tool: name, ok: false, text: resultText });
-                const ans = "(stopped: no results after 4 tries.)";
+                const ans = salvageLocs(executed) || "(stopped: no results after 4 tries.)";
                 const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
                 onEvent({ type: "stopped", reason: "no results after 4 tries", trace, stats });
                 return { answer: ans, trace, stats };
@@ -592,7 +618,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
             resultText = `ALREADY CALLED with identical args; result unchanged. Change the query (check spelling) or give your FINAL answer.`;
             ok = false;
             if (dupCount >= 3) {
-              const ans = "(stopped: model looped on the same failing call.)";
+              const ans = salvageLocs(executed) || "(stopped: model looped on the same failing call.)";
               const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
               onEvent({ type: "stopped", reason: "looped on identical call", trace, stats });
               return { answer: ans, trace, stats };
@@ -618,7 +644,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
               unproductive++;
               if (unproductive >= 4) {
                 onEvent({ type: "tool_result", tool: name, ok: false, text: resultText });
-                const ans = "(stopped: no results after 4 tries — likely misspelled or absent.)";
+                const ans = salvageLocs(executed) || "(stopped: no results after 4 tries — likely misspelled or absent.)";
                 const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
                 onEvent({ type: "stopped", reason: "no results after 4 tries", trace, stats });
                 return { answer: ans, trace, stats };
@@ -630,7 +656,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
         messages.push({ role: "tool", content: resultText.slice(0, 8000), tool_name: name });
       }
     }
-    const ans = `(stopped: ${MAX_STEPS}-step limit)`;
+    const ans = salvageLocs(executed) || `(stopped: ${MAX_STEPS}-step limit)`;
     const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: MAX_STEPS, savings: savings(ans) };
     onEvent({ type: "stopped", reason: `hit ${MAX_STEPS}-step limit`, trace, stats });
     return { answer: ans, trace, stats };
