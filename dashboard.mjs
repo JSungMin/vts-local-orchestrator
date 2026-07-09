@@ -15,7 +15,8 @@ import os from "node:os";
 import path from "node:path";
 import { createAgent } from "./agent-core.mjs";
 import { loadConfig } from "./config-loader.mjs";
-import { readActivity, clearActivity, ACTIVITY_FILE, readLive, LIVE_FILE } from "./activity-log.mjs";
+import { readActivity, clearActivity, ACTIVITY_FILE, readLive, LIVE_FILE, pruneLiveRuns } from "./activity-log.mjs";
+import { killTree } from "./proc-reap.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = loadConfig().port;
@@ -84,6 +85,7 @@ const HTML = String.raw`<!doctype html>
   .ev .b{padding:8px 10px;border-top:1px solid var(--bd);white-space:pre-wrap;word-break:break-word;color:var(--mut)}
   .ev.tool .h{color:var(--tool)} .ev.res .h{color:var(--ok)} .ev.res.bad .h{color:var(--bad)}
   .ev.think .h{color:var(--acc)} .ev.final .h{color:var(--ok)} .ev.stop .h{color:var(--warn)}
+  .ev.note .h{color:var(--warn)} .ev.note .b{color:var(--warn)}
   .pill{font-size:11px;color:var(--mut);font-weight:400}
   .args{color:var(--fg);font-size:12px}
   h3{margin:14px 0 6px;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
@@ -94,7 +96,7 @@ const HTML = String.raw`<!doctype html>
   .tab{background:var(--panel);border:1px solid var(--bd);color:var(--mut);font-weight:600;padding:6px 12px;border-radius:6px}
   .tab.on{background:var(--acc);color:#0d1117}
   details.grp{border:1px solid var(--bd);border-radius:8px;margin:6px 0;background:var(--panel)}
-  details.grp>summary{padding:7px 10px;cursor:pointer;font-weight:700;list-style:none}
+  details.grp>summary{padding:7px 10px;cursor:pointer;font-weight:700;list-style:none;display:flex;align-items:center;gap:6px}
   details.grp>summary::-webkit-details-marker{display:none}
   details.grp>summary:before{content:"▸ ";color:var(--mut)} details.grp[open]>summary:before{content:"▾ "}
   details.kind{margin:4px 8px 4px 16px;border-left:2px solid var(--bd)}
@@ -108,6 +110,10 @@ const HTML = String.raw`<!doctype html>
   .badge.dash{color:var(--acc);border-color:var(--acc)} .badge.cli{color:var(--ok);border-color:var(--ok)}
   .badge.daemon{color:var(--warn);border-color:var(--warn)} .badge.hook{color:var(--tool);border-color:var(--tool)}
   .badge.cache{color:var(--warn)} .save{color:var(--ok);margin-left:auto}
+  .killbtn{margin-left:auto;background:transparent;border:1px solid var(--bd);color:var(--mut);font-weight:600;font-size:11px;padding:2px 8px;border-radius:5px;cursor:pointer}
+  .killbtn:hover{border-color:var(--bad);color:var(--bad)} .killbtn:disabled{opacity:.4;cursor:default}
+  #reapBtn{background:transparent;border:1px solid var(--bd);color:var(--mut);font-weight:600;font-size:11px;padding:3px 9px;border-radius:5px;cursor:pointer;margin-left:8px}
+  #reapBtn:hover{border-color:var(--warn);color:var(--warn)}
   /* activity: flat recent-first history + search */
   #actbar{display:none;margin-bottom:10px;gap:8px}
   #actbar.on{display:flex}
@@ -201,7 +207,7 @@ es.onmessage=e=>{const ev=JSON.parse(e.data);
   else if(ev.type==='tool_call'){tcCount++;set('tc',tcCount);
     const head=[mk('span','', (ev.dup?'🔁 ':'🔧 ')+ev.tool)];el(ev.dup?'tool':'tool',head,JSON.stringify(ev.args,null,1));}
   else if(ev.type==='tool_result'){el('res'+(ev.ok?'':' bad'),(ev.ok?'✅ ':'⚠️ ')+ev.tool,ev.text.slice(0,1500));}
-  else if(ev.type==='final'){dot.className='dot on';set('st','done');applyStats(ev.stats);el('final','🟢 final answer',ev.answer);showSaveOverlay(ev.stats);}
+  else if(ev.type==='final'){dot.className='dot on';set('st','done');applyStats(ev.stats);el('final','🟢 final answer',ev.answer);if(ev.note)el('note','ⓘ note',ev.note);showSaveOverlay(ev.stats);}
   else if(ev.type==='stopped'){dot.className='dot on';set('st','stopped');applyStats(ev.stats);el('stop','🟡 stopped: '+ev.reason,'');}
   else if(ev.type==='ps'){document.getElementById('ps').textContent=ev.text;}
   else if(ev.type==='activity-changed'){loadActivity();}
@@ -307,24 +313,45 @@ function renderLive(items){
   const runs=new Map();
   for(const e of items){if(!runs.has(e.runId))runs.set(e.runId,[]);runs.get(e.runId).push(e);}
   const ids=[...runs.keys()].slice(-5).reverse(); // recent runs, newest first
-  let html='<h3 style="margin:2px 0 6px;color:var(--mut);font-size:11px;text-transform:uppercase">진행 중 · 모든 경로 (위임/CLI/daemon)</h3>';
+  let html='<h3 style="margin:2px 0 6px;color:var(--mut);font-size:11px;text-transform:uppercase">진행 중 · 모든 경로 (위임/CLI/daemon)<button id="reapBtn" title="이미 종료된(죽은) 프로세스의 잔여 항목을 목록에서 정리">🧹 죽은 것 정리</button></h3>';
   for(const id of ids){
     const evs=runs.get(id);
     const q=(evs.find(e=>e.query)||{}).query||(evs.find(e=>e.task)||{}).task||'(task)';
     const proj=(evs.find(e=>e.project)||{}).project||'';
+    const pid=(evs.find(e=>e.pid)||{}).pid;
     const done=evs.some(e=>e.kind==='final');
     const rows=evs.filter(e=>e.kind!=='start').map(e=>{
       const ic=KI[e.kind]||'·';
       const body=e.kind==='final'?esc(e.answer||''):e.kind==='result'?esc(e.preview||''):esc(e.tool||'')+(e.args?' '+esc(JSON.stringify(e.args)):'');
       return '<div class="run" style="border:0;padding:2px 0"><span class="top">'+ic+' '+body+'</span></div>';
     }).join('');
+    // Kill button only for an IN-FLIGHT run (not done); disabled if the live record carries no pid (older entry).
+    const killBtn=done?'':'<button class="killbtn" data-run="'+esc(id)+'"'+(pid?'':' disabled')
+      +' title="이 실행 프로세스'+(pid?' (pid '+pid+')':' (pid 없음)')+' 강제 종료">✕ kill</button>';
     html+='<details class="grp" open><summary>'+(done?'🟢':'<span class="dot run"></span>')+' <b>'+esc(q.slice(0,90))+'</b>'
-      +(proj?' <span class="pill">'+esc(short(proj))+'</span>':'')+'</summary><div class="runs">'+rows+'</div></details>';
+      +(proj?' <span class="pill">'+esc(short(proj))+'</span>':'')+killBtn+'</summary><div class="runs">'+rows+'</div></details>';
   }
   box.innerHTML=html;
 }
 async function loadLive(){try{const j=await (await fetch('/live?limit=200')).json();renderLive(j);}catch{}}
 loadLive();
+// Kill / reap: event-delegated on the live box (its innerHTML is replaced each refresh, but the box element
+// persists, so one listener covers every future button). Kill terminates the run's process tree; reap drops
+// list entries whose process already exited.
+document.getElementById('live').addEventListener('click',async e=>{
+  const kb=e.target.closest('.killbtn');
+  if(kb&&!kb.disabled){const id=kb.dataset.run;
+    if(!confirm('이 실행 프로세스를 강제 종료할까요? 진행 중인 작업이 중단됩니다.'))return;
+    kb.disabled=true;
+    try{const r=await (await fetch('/live/kill',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({runId:id})})).json();
+      if(!r.killed&&r.reason)alert(r.reason);}
+    catch(err){alert('종료 실패: '+err.message);}
+    loadLive();return;}
+  const rb=e.target.closest('#reapBtn');
+  if(rb){rb.disabled=true;
+    try{await fetch('/live/reap',{method:'POST'});}catch(err){alert(err.message);}
+    loadLive();}
+});
 </script></body></html>`;
 
 const server = http.createServer(async (req, res) => {
@@ -364,6 +391,42 @@ const server = http.createServer(async (req, res) => {
     const limit = Math.min(400, Math.max(1, Number(new URLSearchParams(q).get("limit")) || 200));
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     return res.end(JSON.stringify(readLive(limit)));
+  }
+  if (url === "/live/kill" && req.method === "POST") {
+    // Force-terminate a specific in-flight run's process tree, then drop its live entries. Self-guarded:
+    // never kills the dashboard's own PID. Local-only (127.0.0.1). The pid rides on the live records.
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let runId;
+      try { runId = JSON.parse(body).runId; } catch { res.writeHead(400); return res.end("bad json"); }
+      if (!runId) { res.writeHead(400); return res.end("no runId"); }
+      const pid = (readLive(400).find((e) => e.runId === runId && e.pid) || {}).pid;
+      let killed = false, reason = "";
+      if (!pid) reason = "no live pid (process already exited?)";
+      else if (pid === process.pid) reason = "refused: that is the dashboard's own process";
+      else { try { killTree(pid); killed = true; } catch (e) { reason = "kill failed: " + e.message; } }
+      pruneLiveRuns(new Set([runId])); // drop the entry whether we killed it or it was already gone
+      broadcast({ type: "live-changed" });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ killed, pid: pid || null, reason }));
+    });
+    return;
+  }
+  if (url === "/live/reap" && req.method === "POST") {
+    // Sweep live entries whose process is no longer alive (stale/zombie leftovers). Skips the dashboard PID.
+    const byRun = new Map();
+    for (const e of readLive(400)) if (!byRun.has(e.runId)) byRun.set(e.runId, e.pid);
+    const dead = new Set();
+    for (const [runId, pid] of byRun) {
+      if (!pid || pid === process.pid) continue;
+      try { process.kill(pid, 0); } catch { dead.add(runId); } // ESRCH → the process is gone
+    }
+    pruneLiveRuns(dead);
+    broadcast({ type: "live-changed" });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ reaped: dead.size }));
+    return;
   }
   if (url === "/activity/clear" && req.method === "POST") {
     // Wipe the local activity history at the user's request (from the dashboard's 🗑 button). Local-only.
