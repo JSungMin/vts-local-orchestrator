@@ -200,6 +200,32 @@ function verifyAnswerPaths(raw, results) {
   return { raw: kept.join("\n").trim(), droppedPaths, droppedLines };
 }
 
+// SALVAGE — the small model sometimes loops or hits the step limit AFTER a search already returned real
+// locations (observed: a big "60 match(es) … capped" result it misread as "incomplete", then re-queried into a
+// dead end with an emptied projectPath). Rather than ship a FALSE "no match", recover the largest set of
+// path:line locations already sitting in the tool results and fold it as the answer. Parses the tool output
+// shape `under <dir>/` header + `  <relfile>:<line>: text` rows (search_text/find_files), grouping per file.
+function salvageLocs(executed) {
+  let best = null, bestN = -1;
+  for (const rt of (executed && executed.values ? [...executed.values()] : [])) {
+    const byFile = new Map();
+    let pre = "";
+    for (const ln of String(rt).split("\n")) {
+      const pm = ln.match(/^under (.+?)\/?\s*$/);
+      if (pm) { pre = pm[1].replace(/\\/g, "/"); continue; }
+      const m = ln.match(/^\s*([^\s:][^:]*\.[A-Za-z0-9_]+):(\d+)\b/);
+      if (!m) continue;
+      const file = pre && !m[1].includes("/") ? pre + "/" + m[1] : m[1];
+      if (!byFile.has(file)) byFile.set(file, new Set());
+      byFile.get(file).add(m[2]);
+    }
+    const n = [...byFile.values()].reduce((a, s) => a + s.size, 0);
+    if (n > bestN) { bestN = n; best = byFile; }
+  }
+  if (!best || bestN <= 0) return null;
+  return [...best].map(([f, s]) => `${f}:${[...s].sort((a, b) => Number(a) - Number(b)).join(",")}`).join("\n");
+}
+
 // Small local models often ignore the compact `path:line` contract and instead echo the tool-result line
 // VERBATIM as markdown — `* path:214: <the whole source line>` under a `**Symbol**` header. That form is
 // heavy (source text + long paths repeated per hit) and, because it does NOT end at the line number, it slips
@@ -1214,6 +1240,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
             messages.push({ role: "tool", content: resultText, tool_name: name });
             return {
               answer:
+                salvageLocs(executed) ||
                 "(stopped: the local model looped on the same failing call. Last attempts: " +
                 trace.slice(-3).map((t) => t.tool + "(" + JSON.stringify(t.args) + ")").join(", ") +
                 ". Likely a misspelled query or no match.)",
@@ -1276,6 +1303,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
               });
               return {
                 answer:
+                  salvageLocs(executed) ||
                   "(stopped: no results after 4 tries. Tried: " +
                   trace.slice(-4).map((t) => `${t.tool} q=${JSON.stringify(t.args.q ?? t.args.symbol ?? t.args)}`).join(" | ") +
                   ". Likely a misspelled query term or genuinely absent.)",
@@ -1295,7 +1323,7 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
       });
     }
   }
-  return { answer: `(stopped: hit ${MAX_STEPS}-step limit without a final answer)`, trace, acct, results: [...executed.values()] };
+  return { answer: salvageLocs(executed) || `(stopped: hit ${MAX_STEPS}-step limit without a final answer)`, trace, acct, results: [...executed.values()] };
 }
 
 // One locate: cache-check → run the model on a FRESH history (independent of other queries) → cache-write

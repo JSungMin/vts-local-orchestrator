@@ -47,6 +47,9 @@ TOOL CHOICE (first match wins):
 RULES:
 - Copy names from the task EXACTLY, character for character (case included).
 - A positive tool result is ground truth: report it directly; never re-verify it, never overturn it.
+- A CAPPED result ("capped at N", "more exist", "tee file …") is STILL a positive result: fold the shown
+  file:line and answer NOW. NEVER re-issue the same search hoping for more — it returns the same slice and
+  loops the turn to a false "no match". A big match list is a good answer, not a failure.
 - A result note that says find_references is "semantic + COMPLETE" -> do THAT: find_references symbol="X"
   (one call, whole tree). Do not re-scope guessed files or trust a truncated text scan.
 - Never guess a file, scope to it, and on no-match guess another file: an inherited symbol is NOT in the
