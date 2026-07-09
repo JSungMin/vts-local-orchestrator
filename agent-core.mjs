@@ -17,6 +17,10 @@ import { definitionSearches, detectLang, rankHits } from "./defn-patterns.mjs";
 import { buildSystem } from "./system-prompt.mjs";
 import { logActivity } from "./activity-log.mjs";
 import { recordLspOutcome, lspVerdict, LSP_TRACK } from "./lsp-stats.mjs";
+// SHARED answer/tool-call helpers — single source of truth with vts-bridge.mjs (the CLI path) so the two
+// never drift again. Brings the gemma bare-call parser + the full final-answer pipeline (fabrication guard,
+// control-token strip, normalise, group) the dashboard was previously missing. See answer-pipeline.mjs.
+import { parseToolCallsFromText, salvageLocs, finalizeAnswer } from "./answer-pipeline.mjs";
 
 const CFG = loadConfig();
 const OLLAMA_HOST = CFG.ollamaHost;
@@ -54,32 +58,6 @@ function loadRawRatios() {
   } catch {
     return { _global: 1 };
   }
-}
-
-// SALVAGE (mirror of vts-bridge.mjs) — the small model sometimes loops or hits the step limit AFTER a search
-// already returned real locations (a big "60 match(es) … capped" result it misread as "incomplete", then
-// re-queried into a dead end). Rather than ship a FALSE "no match", recover the largest set of path:line
-// locations already sitting in the tool results and fold it as the answer. Parses the tool output shape
-// `under <dir>/` header + `  <relfile>:<line>: text` rows (search_text/find_files), grouping per file.
-function salvageLocs(executed) {
-  let best = null, bestN = -1;
-  for (const rt of (executed && executed.values ? [...executed.values()] : [])) {
-    const byFile = new Map();
-    let pre = "";
-    for (const ln of String(rt).split("\n")) {
-      const pm = ln.match(/^under (.+?)\/?\s*$/);
-      if (pm) { pre = pm[1].replace(/\\/g, "/"); continue; }
-      const m = ln.match(/^\s*([^\s:][^:]*\.[A-Za-z0-9_]+):(\d+)\b/);
-      if (!m) continue;
-      const file = pre && !m[1].includes("/") ? pre + "/" + m[1] : m[1];
-      if (!byFile.has(file)) byFile.set(file, new Set());
-      byFile.get(file).add(m[2]);
-    }
-    const n = [...byFile.values()].reduce((a, s) => a + s.size, 0);
-    if (n > bestN) { bestN = n; best = byFile; }
-  }
-  if (!best || bestN <= 0) return null;
-  return [...best].map(([f, s]) => `${f}:${[...s].sort((a, b) => Number(a) - Number(b)).join(",")}`).join("\n");
 }
 
 export function readProjectPath() {
@@ -147,58 +125,8 @@ function sanitizeScopeArgs(name, args, project) {
   return args;
 }
 
-function extractJsonBlobs(text) {
-  const out = [];
-  const s = String(text);
-  for (let i = 0; i < s.length; i++) {
-    const open = s[i];
-    if (open !== "{" && open !== "[") continue;
-    const close = open === "{" ? "}" : "]";
-    let depth = 0, inStr = false, esc = false;
-    for (let j = i; j < s.length; j++) {
-      const ch = s[j];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (ch === "\\") esc = true;
-        else if (ch === '"') inStr = false;
-        continue;
-      }
-      if (ch === '"') inStr = true;
-      else if (ch === open) depth++;
-      else if (ch === close) {
-        depth--;
-        if (depth === 0) { out.push(s.slice(i, j + 1)); i = j; break; }
-      }
-    }
-  }
-  return out;
-}
-
-function parseToolCallsFromText(content, validNames) {
-  if (!content) return [];
-  const tagged = [];
-  for (const m of String(content).matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)) tagged.push(m[1]);
-  for (const m of String(content).matchAll(/```(?:json|tool_call)?\s*([\s\S]*?)```/g)) tagged.push(m[1]);
-  const sources = tagged.length ? tagged : [content];
-  const calls = [];
-  const seen = new Set();
-  for (const src of sources) {
-    for (const blob of extractJsonBlobs(src)) {
-      let parsed;
-      try { parsed = JSON.parse(blob); } catch { continue; }
-      for (const c of Array.isArray(parsed) ? parsed : [parsed]) {
-        if (!c || typeof c.name !== "string" || !validNames.has(c.name)) continue;
-        const args = c.arguments ?? c.parameters ?? {};
-        const key = c.name + JSON.stringify(args);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        calls.push({ function: { name: c.name, arguments: args } });
-      }
-    }
-    if (calls.length) break;
-  }
-  return calls;
-}
+// extractJsonBlobs / parseToolCallsFromText now live in the shared answer-pipeline.mjs (imported above) —
+// the imported parser adds gemma bare-call recovery the local copy lacked.
 
 const isEmptyResult = (r) => {
   if (!r || r.trim().length < 3) return true;
@@ -530,8 +458,11 @@ export async function createAgent({ onEvent = () => {} } = {}) {
     const messages = [{ role: "system", content: SYSTEM }, { role: "user", content: task }];
     const trace = [];
     const executed = new Map();
-    let dupCount = 0, unproductive = 0;
+    let dupCount = 0, unproductive = 0, malformedRetries = 0;
     const t0 = Date.now();
+    // Final-answer treatment shared with the CLI path: control-token strip → note peel → normalise →
+    // fabrication guard (drop path:line not present in any tool result) → prefix strip → group per file.
+    const finalize = (raw) => finalizeAnswer(raw, [...executed.values()], project);
     let totalEval = 0, totalEvalMs = 0;
     // token accounting for the 3-way savings panel:
     //   outTokSum = capped vts results (what CC-using-vts would eat) ; rawTokSum = estimated uncapped
@@ -560,10 +491,19 @@ export async function createAgent({ onEvent = () => {} } = {}) {
 
       let calls = msg.tool_calls?.length ? msg.tool_calls : parseToolCallsFromText(msg.content, validNames);
       if (!calls.length) {
-        const ans = msg.content || "(no answer)";
+        // Content that LOOKS like a tool call (a valid tool name glued to a brace blob) but survived no parser
+        // pass is a MALFORMED emission, not an answer — returning it verbatim ships a raw call string as the
+        // "answer". Give bounded corrective retries instead (mirror of vts-bridge's malformedRetries).
+        const looksCall = /^\s*([A-Za-z_]\w*)\s*\{/.exec(msg.content || "");
+        if (looksCall && validNames.has(looksCall[1]) && malformedRetries++ < 2) {
+          messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
+          continue;
+        }
+        const fin = finalize(msg.content || "(no answer)");
+        const ans = fin.answer || "no match";
         const stats = { ms: Date.now() - t0, evalCount: totalEval, tokPerSec: totalEvalMs ? +(totalEval / (totalEvalMs / 1000)).toFixed(1) : 0, steps: step + 1, savings: savings(ans) };
-        onEvent({ type: "final", answer: ans, trace, stats });
-        return { answer: ans, trace, stats };
+        onEvent({ type: "final", answer: ans, note: fin.note, trace, stats });
+        return { answer: ans, note: fin.note, trace, stats };
       }
 
       for (const call of calls) {
@@ -581,7 +521,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
             resultText = "ALREADY CALLED def_search with these args; give your FINAL answer or try a different name/lang.";
             ok = false;
             if (dupCount >= 3) {
-              const ans = salvageLocs(executed) || "(stopped: looped on def_search.)";
+              const ans = finalize(salvageLocs(executed) || "(stopped: looped on def_search.)").answer;
               const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
               onEvent({ type: "stopped", reason: "looped on def_search", trace, stats });
               return { answer: ans, trace, stats };
@@ -598,7 +538,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
               unproductive++;
               if (unproductive >= 4) {
                 onEvent({ type: "tool_result", tool: name, ok: false, text: resultText });
-                const ans = salvageLocs(executed) || "(stopped: no results after 4 tries.)";
+                const ans = finalize(salvageLocs(executed) || "(stopped: no results after 4 tries.)").answer;
                 const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
                 onEvent({ type: "stopped", reason: "no results after 4 tries", trace, stats });
                 return { answer: ans, trace, stats };
@@ -618,7 +558,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
             resultText = `ALREADY CALLED with identical args; result unchanged. Change the query (check spelling) or give your FINAL answer.`;
             ok = false;
             if (dupCount >= 3) {
-              const ans = salvageLocs(executed) || "(stopped: model looped on the same failing call.)";
+              const ans = finalize(salvageLocs(executed) || "(stopped: model looped on the same failing call.)").answer;
               const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
               onEvent({ type: "stopped", reason: "looped on identical call", trace, stats });
               return { answer: ans, trace, stats };
@@ -644,7 +584,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
               unproductive++;
               if (unproductive >= 4) {
                 onEvent({ type: "tool_result", tool: name, ok: false, text: resultText });
-                const ans = salvageLocs(executed) || "(stopped: no results after 4 tries — likely misspelled or absent.)";
+                const ans = finalize(salvageLocs(executed) || "(stopped: no results after 4 tries — likely misspelled or absent.)").answer;
                 const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: step + 1, savings: savings(ans) };
                 onEvent({ type: "stopped", reason: "no results after 4 tries", trace, stats });
                 return { answer: ans, trace, stats };
@@ -656,7 +596,7 @@ export async function createAgent({ onEvent = () => {} } = {}) {
         messages.push({ role: "tool", content: resultText.slice(0, 8000), tool_name: name });
       }
     }
-    const ans = salvageLocs(executed) || `(stopped: ${MAX_STEPS}-step limit)`;
+    const ans = finalize(salvageLocs(executed) || `(stopped: ${MAX_STEPS}-step limit)`).answer;
     const stats = { ms: Date.now() - t0, evalCount: totalEval, steps: MAX_STEPS, savings: savings(ans) };
     onEvent({ type: "stopped", reason: `hit ${MAX_STEPS}-step limit`, trace, stats });
     return { answer: ans, trace, stats };
