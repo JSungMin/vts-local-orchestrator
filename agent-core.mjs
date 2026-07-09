@@ -405,7 +405,12 @@ export async function createAgent({ onEvent = () => {} } = {}) {
     // Only HARD mode drops the clangd-backed tools; SOFT/OFF keep them (soft relies on the short timeouts).
     // A syntactic index keeps search_symbol/document_symbols/read_symbol (tree-sitter tier). Mirrors vts-bridge.
     if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) {
-      const SYN_OK = new Set(["search_symbol", "document_symbols", "read_symbol"]);
+      // KEEP only the tools the server pre-empts from the syntactic index with NO clangd: search_symbol
+      // (committed-index decl) and find_references (time-boxed usage + committed decl). document_symbols and
+      // read_symbol have no syntactic backend — they route to clangd's AST and fail `-32602: AST for
+      // non-added document` on an unindexed tree — so they drop with the rest. Mirrors vts-bridge.mjs (this
+      // previously also DROPPED find_references, dead-ending who-calls on syntactic trees — now fixed).
+      const SYN_OK = new Set(["search_symbol", "find_references"]);
       const dropSet = HAS_SYN ? new Set([...INDEX_TOOLS].filter((t) => !SYN_OK.has(t))) : INDEX_TOOLS;
       requested = requested.filter((n) => !dropSet.has(n));
     }

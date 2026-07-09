@@ -1745,18 +1745,21 @@ async function main() {
     // LSP timeouts above to fast-fail; OFF keeps them with the normal long waits. (INDEX_USABLE / NARROW_HARD
     // were computed before the spawn.)
     if ((NARROW_HARD && !INDEX_USABLE) || CIRCUIT_OPEN || NO_INDEX) {
-      // A tree-sitter syntactic index answers search_symbol/document_symbols/read_symbol with NO clangd — so
-      // when one exists keep those and drop only the truly clangd-only tools (def/hover/diagnostics/concept).
-      // find_references is ALSO kept: the server (vts ≥0.42.7) pre-empts a by-name refs query on such trees
-      // with time-boxed literal usage lines + the committed-index declaration, so it never blocks on a clangd
-      // crawl — dropping it made every "who calls X" task dead-end at the declaration (live dogfood).
-      // Without a syntactic index, drop the whole clangd-backed set (index-free walk/grep only).
-      const SYN_OK = new Set(["search_symbol", "document_symbols", "read_symbol", "find_references"]);
+      // With a tree-sitter syntactic index the SERVER pre-empts exactly two tools with NO clangd:
+      // search_symbol (committed-index declaration lookup, vts ≥0.42.2) and find_references (time-boxed literal
+      // usage + committed-index decl, vts ≥0.42.7) — dropping find_references made every "who calls X" task
+      // dead-end at the declaration (live dogfood), so it stays. document_symbols and read_symbol have NO
+      // syntactic backend: they still route to clangd's AST, which on an unindexed tree fails with
+      // `-32602: AST for non-added document` (observed on a UE tree — the model then wastes a step and the
+      // result is a hard error, not evidence). So KEEP only search_symbol + find_references; document_symbols/
+      // read_symbol are clangd-only and drop with the rest. Without a syntactic index, drop the whole set.
+      const SYN_OK = new Set(["search_symbol", "find_references"]);
       const dropSet = HAS_SYN ? new Set([...INDEX_TOOLS].filter((t) => !SYN_OK.has(t))) : INDEX_TOOLS;
       requested = requested.filter((n) => !dropSet.has(n));
       if (HAS_SYN) process.stderr.write(
         `[vts-local] syntactic symbol index present (${SYMBOL_ROOT}\\.vts-index) — keeping search_symbol/` +
-          `document_symbols/read_symbol/find_references (tree-sitter tier + text-usage fallback), dropping clangd-only def/hover.\n`,
+          `find_references (committed-index tier + text-usage fallback), dropping clangd-only tools including ` +
+          `document_symbols/read_symbol (no syntactic backend — clangd AST errors -32602 on an unindexed tree).\n`,
       );
       else if (!CIRCUIT_OPEN && !NO_INDEX) process.stderr.write(
         `[vts-local] QVTS_AUTO_NARROW=hard and no clangd index for ${PROJECT} — exposing index-free ` +
