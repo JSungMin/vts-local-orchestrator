@@ -144,10 +144,27 @@ export function verifyAnswerPaths(raw, results) {
     // hits, the guard nuked all 7 → "no match" → the caller abandoned qvts). Also accept a `basename:` data
     // line as a carrier so the answer's line numbers reconcile against the lines that actually carry them.
     const base = segs[segs.length - 1];
-    const carriers = blobLines.filter((bl) => bl.includes(p) || (tail && bl.includes(tail)) || (base && bl.includes(base + ":")));
-    if (!carriers.length) { droppedPaths++; return null; } // path never appeared in any tool result
+    // Harvest claimed line numbers ONLY from the `<path>:NN` token that actually bears this location — try the
+    // full path, then the trailing two segments, then the compacted `basename:NN` data line. Never scan every
+    // digit on the line: doing so let source text (loop bounds, years in a result's code snippet) spuriously
+    // "verify" an invented number, and a loose basename-anywhere match let a same-named file in a DIFFERENT
+    // directory donate its line numbers to a fabricated path.
+    const numsAt = (bl, needle) => {
+      const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp("(?:^|[\\s/\\\\])" + esc + ":(\\d+(?:,\\d+)*)", "g");
+      const found = [];
+      for (let mm; (mm = re.exec(bl)); ) found.push(...mm[1].split(","));
+      return found;
+    };
     const nums = new Set();
-    for (const c of carriers) for (const t of c.match(/\d+/g) || []) nums.add(t);
+    let carried = false;
+    for (const bl of blobLines) {
+      const byPath = numsAt(bl, p);
+      const chosen = byPath.length ? byPath : (tail ? numsAt(bl, tail) : []);
+      const use = chosen.length ? chosen : numsAt(bl, base);
+      if (use.length) { carried = true; for (const n of use) nums.add(n); }
+    }
+    if (!carried) { droppedPaths++; return null; } // path never appeared as a numbered location in any result
     const claimed = m[2].split(",");
     const verified = claimed.filter((n) => nums.has(n));
     droppedLines += claimed.length - verified.length;
