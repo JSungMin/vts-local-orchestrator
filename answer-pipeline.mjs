@@ -205,14 +205,21 @@ export function verifyAnswerPaths(raw, results) {
 // path:line locations already sitting in the tool results and fold it as the answer. Parses the tool output
 // shape `under <dir>/` header + `  <relfile>:<line>: text` rows (search_text/find_files), grouping per file.
 export function salvageLocs(executed) {
+  // Accept either the CLI/dashboard `executed` Map or a plain array of result strings (finalizeAnswer holds the
+  // latter), so the fabrication-guard fallback can salvage without reconstructing a Map.
+  const sources = executed && executed.values ? [...executed.values()] : (Array.isArray(executed) ? executed : []);
   let best = null, bestN = -1;
-  for (const rt of (executed && executed.values ? [...executed.values()] : [])) {
+  for (const rt of sources) {
     const byFile = new Map();
     let pre = "";
     for (const ln of String(rt).split("\n")) {
       const pm = ln.match(/^under (.+?)\/?\s*$/);
       if (pm) { pre = pm[1].replace(/\\/g, "/"); continue; }
-      const m = ln.match(/^\s*([^\s:][^:]*\.[A-Za-z0-9_]+):(\d+)\b/);
+      // Optional `DRIVE:` prefix so a Windows ABSOLUTE path (`G:/…/File.h:11` — the shape clangd/def_search
+      // return) parses: the drive colon otherwise terminated the `[^:]*` path class and salvage returned null on
+      // every absolute-path result (live UE dogfood — a real decl candidate was discarded as unsalvageable, so a
+      // hallucinated answer that the fabrication guard nuked fell through to a false "no match").
+      const m = ln.match(/^\s*((?:[A-Za-z]:)?[^\s:]*\.[A-Za-z0-9_]+):(\d+)\b/);
       if (!m) continue;
       const file = pre && !m[1].includes("/") ? pre + "/" + m[1] : m[1];
       if (!byFile.has(file)) byFile.set(file, new Set());
@@ -297,7 +304,10 @@ export function finalizeAnswer(rawAnswer, results, project) {
   raw = normalizeLocLines(raw);
   const v = verifyAnswerPaths(raw, results);
   if (v.droppedPaths || v.droppedLines) {
-    raw = v.raw || "no match";
+    // When the guard empties the answer, the model fabricated its path/line — but the tool results may still
+    // hold the REAL locations for this query. Salvage them instead of reporting a false "no match" (live UE:
+    // the model hallucinated an `Engine/…` path while the correct decl sat in the def_search result).
+    raw = v.raw || salvageLocs(results) || "no match";
     note = ((note ? note + "; " : "") +
       `fabrication guard: discarded ${v.droppedPaths} path(s) / ${v.droppedLines} line number(s) not present in any tool result`).slice(0, 300);
   }
