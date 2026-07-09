@@ -1,6 +1,6 @@
 {
   "name": "vts-local-orchestrator",
-  "version": "0.20.8",
+  "version": "0.20.9",
   "description": "Delegate cheap code-location to ANY local LLM (Ollama, full-GPU) that drives vs-token-safer's vs-search tools — so Claude spends its tokens on reasoning, not raw search output. Model-agnostic (default gemma4:e4b). Ships the qvts CLI, a live web dashboard with a 3-way token-savings panel, and an auto-loading delegation-routing skill.",
   "author": {
     "name": "D4ANote"
