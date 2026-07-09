@@ -296,7 +296,16 @@ export function finalizeAnswer(rawAnswer, results, project) {
 // it use). A single- or two-symbol locate never trips (that's exactly what qvts is for).
 export function detectComplexQuery(query) {
   const q = String(query || "");
-  const syms = [...new Set(q.match(/\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/g) || [])];
+  // Scrub path/namespace tokens BEFORE counting symbols. A single "find DoThing in Source/MyGameCore/
+  // MyPlayerController.cpp" locate must NOT read as a 3-symbol multi-part ask — PascalCase path segments and a
+  // `Ns::Class::Method` chain are ONE target concept, not several. Without this, file-scoped locates against a
+  // PascalCase-heavy tree (Unreal Source/…) tripped the guard and got refused with a decomposition hint (live
+  // false positive). Genuine multi-part queries keep their real symbols after the scrub, so detection survives.
+  const scrub = q
+    .replace(/[A-Za-z0-9_.\\-]*[/\\][A-Za-z0-9_./\\-]*/g, " ") // a path-ish token (contains a slash)
+    .replace(/\b[A-Za-z_]\w*(?:::[A-Za-z_]\w*)+\b/g, " ")       // a C++ namespace/member chain A::B::C
+    .replace(/\b[\w-]+\.[A-Za-z0-9_]+\b/g, " ");                // a bare filename.ext (no slash)
+  const syms = [...new Set(scrub.match(/\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/g) || [])];
   const markers = (q.match(/\b(list|whether|relative to|the full|body|range|report|does it use)\b/gi) || []).length;
   const complex = syms.length >= 3 || (syms.length >= 2 && markers >= 2);
   if (!complex) return { complex: false, symbols: syms };
