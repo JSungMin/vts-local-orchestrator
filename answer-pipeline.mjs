@@ -57,27 +57,9 @@ export function parseToolCallsFromText(content, validNames) {
   const sources = tagged.length ? tagged : [content];
   const calls = [];
   const seen = new Set();
-  // gemma-style BARE calls: `tool_name {json-args}` as plain text — no {name,arguments} wrapper, no tags,
-  // no fence. Seen live twice in one day: the model printed the call as its final content, every pass
-  // below missed it (the JSON blob has no `name` field), and the raw call text shipped as the "answer".
-  // Per-line so several stacked calls all parse; only exact valid tool names match, so prose is immune.
-  for (const line of String(content).split("\n")) {
-    const m = /^\s*([A-Za-z_]\w*)\s*(\{.*\})\s*$/.exec(line);
-    if (!m || !validNames.has(m[1])) continue;
-    // gemma emission repair: literal quote tokens (`<|"|>`) leak into the text form, and keys can arrive
-    // unquoted (`{symbol:"X"}`). Try strict JSON first, then the artifact-repaired/relaxed form.
-    const jsonish = m[2].replace(/<\|"\|>/g, '"');
-    for (const cand of [jsonish, jsonish.replace(/([{,]\s*)([A-Za-z_]\w*)\s*:/g, '$1"$2":')]) {
-      let args;
-      try { args = JSON.parse(cand); } catch { continue; }
-      if (args && typeof args === "object" && !Array.isArray(args)) {
-        const key = m[1] + JSON.stringify(args);
-        if (!seen.has(key)) { seen.add(key); calls.push({ function: { name: m[1], arguments: args } }); }
-        break;
-      }
-    }
-  }
-  if (calls.length) return calls;
+  // Prefer the STRUCTURED forms first — a {name,arguments} blob inside a <tool_call> tag, a ```json fence, or
+  // bare in the content. Only if none parse do we fall back to the gemma bare-call form below; otherwise a
+  // final-answer line that merely reads `tool_name {json}` would preempt a real tagged/fenced call.
   for (const src of sources) {
     for (const blob of extractJsonBlobs(src)) {
       let parsed;
@@ -96,6 +78,28 @@ export function parseToolCallsFromText(content, validNames) {
       }
     }
     if (calls.length) break; // first source that yields valid calls wins
+  }
+  if (calls.length) return calls;
+  // gemma-style BARE calls (FALLBACK): `tool_name {json-args}` as plain text — no {name,arguments} wrapper,
+  // no tags, no fence. Seen live twice in one day: the model printed the call as its final content, the
+  // structured pass missed it (the JSON blob has no `name` field), and the raw call text shipped as the
+  // "answer". Per-line so several stacked calls all parse; only exact valid tool names match, so prose is
+  // immune. Runs only when no structured call was found, so it can't hijack a legitimate tagged/fenced call.
+  for (const line of String(content).split("\n")) {
+    const m = /^\s*([A-Za-z_]\w*)\s*(\{.*\})\s*$/.exec(line);
+    if (!m || !validNames.has(m[1])) continue;
+    // gemma emission repair: literal quote tokens (`<|"|>`) leak into the text form, and keys can arrive
+    // unquoted (`{symbol:"X"}`). Try strict JSON first, then the artifact-repaired/relaxed form.
+    const jsonish = m[2].replace(/<\|"\|>/g, '"');
+    for (const cand of [jsonish, jsonish.replace(/([{,]\s*)([A-Za-z_]\w*)\s*:/g, '$1"$2":')]) {
+      let args;
+      try { args = JSON.parse(cand); } catch { continue; }
+      if (args && typeof args === "object" && !Array.isArray(args)) {
+        const key = m[1] + JSON.stringify(args);
+        if (!seen.has(key)) { seen.add(key); calls.push({ function: { name: m[1], arguments: args } }); }
+        break;
+      }
+    }
   }
   return calls;
 }

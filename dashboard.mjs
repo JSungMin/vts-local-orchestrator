@@ -83,7 +83,7 @@ const HTML = String.raw`<!doctype html>
   .ev{border:1px solid var(--bd);border-radius:8px;margin:8px 0;background:var(--panel);overflow:hidden}
   .ev .h{padding:6px 10px;font-weight:700;display:flex;justify-content:space-between;align-items:center}
   .ev .b{padding:8px 10px;border-top:1px solid var(--bd);white-space:pre-wrap;word-break:break-word;color:var(--mut)}
-  .ev.tool .h{color:var(--tool)} .ev.res .h{color:var(--ok)} .ev.res.bad .h{color:var(--bad)}
+  .ev.tool .h{color:var(--tool)} .ev.tool.dup{opacity:.55} .ev.res .h{color:var(--ok)} .ev.res.bad .h{color:var(--bad)}
   .ev.think .h{color:var(--acc)} .ev.final .h{color:var(--ok)} .ev.stop .h{color:var(--warn)}
   .ev.note .h{color:var(--warn)} .ev.note .b{color:var(--warn)}
   .pill{font-size:11px;color:var(--mut);font-weight:400}
@@ -205,7 +205,7 @@ es.onmessage=e=>{const ev=JSON.parse(e.data);
     const b=curThink.querySelector('.b');b.textContent+=ev.text;log.scrollTop=1e9;}
   else if(ev.type==='assistant_done'){if(curThink&&ev.stats&&ev.stats.evalCount){curThink.querySelector('.pill').textContent=ev.stats.evalCount+' tok';}curThink=null;}
   else if(ev.type==='tool_call'){tcCount++;set('tc',tcCount);
-    const head=[mk('span','', (ev.dup?'🔁 ':'🔧 ')+ev.tool)];el(ev.dup?'tool':'tool',head,JSON.stringify(ev.args,null,1));}
+    const head=[mk('span','', (ev.dup?'🔁 ':'🔧 ')+ev.tool)];el(ev.dup?'tool dup':'tool',head,JSON.stringify(ev.args,null,1));}
   else if(ev.type==='tool_result'){el('res'+(ev.ok?'':' bad'),(ev.ok?'✅ ':'⚠️ ')+ev.tool,ev.text.slice(0,1500));}
   else if(ev.type==='final'){dot.className='dot on';set('st','done');applyStats(ev.stats);el('final','🟢 final answer',ev.answer);if(ev.note)el('note','ⓘ note',ev.note);showSaveOverlay(ev.stats);}
   else if(ev.type==='stopped'){dot.className='dot on';set('st','stopped');applyStats(ev.stats);el('stop','🟡 stopped: '+ev.reason,'');}
