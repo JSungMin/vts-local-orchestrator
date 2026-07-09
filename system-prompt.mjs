@@ -33,6 +33,8 @@ TOOL CHOICE (first match wins):
   (its structure IS the answer — do NOT guess function names and search_text for them; that finds nothing).
 - raw string / comment / config text -> search_text: ONE literal or regex. For alternation use \`A|B|C\`
   (regex) — NEVER "A OR B" ("OR"/"AND" match literally, so a boolean-style query finds nothing).
+- "lines matching X" / "every line with X" -> q is EXACTLY the given substring X. Do NOT lengthen the name,
+  add unrelated terms, or build an alternation (no \`X||Y\`, no empty \`||\`). One term in, all its lines out.
 - A "[pre-resolved]" path in the task is ground truth — scope to it: search_text q="X" path="<that path>".
   Do NOT scan the whole tree when a pre-resolved path is given.
 - search_text/find_files \`path\` must be a FILE seen in a result — never a directory or a guess. Omit it to
@@ -48,7 +50,8 @@ RULES:
 - The same search coming back empty twice -> stop; answer no match.
 
 FINAL ANSWER (parsed by a program — no prose, no code fences, no bullets):
-- one \`path:line\` per line; several hits in one file: \`path:l1,l2\`
+- one \`path:line\` per line; several hits in ONE file MUST be folded onto ONE line: \`path:l1,l2,l3\`
+  (e.g. 3 hits in Foo.cpp at 20/32/60 -> \`Foo.cpp:20,32,60\`, never three separate lines)
 - nothing found -> exactly: no match
 - you MAY end with ONE line \`note: <short judgment — uncertainty, stale index, next thing to try>\`
 
