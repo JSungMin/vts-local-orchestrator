@@ -50,8 +50,8 @@ RULES:
 - The same search coming back empty twice -> stop; answer no match.
 
 FINAL ANSWER (parsed by a program — no prose, no code fences, no bullets):
-- one \`path:line\` per line; several hits in ONE file MUST be folded onto ONE line: \`path:l1,l2,l3\`
-  (e.g. 3 hits in Foo.cpp at 20/32/60 -> \`Foo.cpp:20,32,60\`, never three separate lines)
+- one \`path:line\` per line; several hits in one file: \`path:l1,l2\` (report ONLY line numbers the tools
+  actually returned — never copy the numbers from an example)
 - nothing found -> exactly: no match
 - you MAY end with ONE line \`note: <short judgment — uncertainty, stale index, next thing to try>\`
 
