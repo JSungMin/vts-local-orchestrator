@@ -500,14 +500,22 @@ export async function createAgent({ onEvent = () => {} } = {}) {
         // pass is a MALFORMED emission, not an answer — returning it verbatim ships a raw call string as the
         // "answer". Give bounded corrective retries instead (mirror of vts-bridge's malformedRetries).
         const looksCall = /^\s*([A-Za-z_]\w*)\s*:?\s*\{/.exec(msg.content || "");
-        if (looksCall && validNames.has(looksCall[1]) && malformedRetries++ < 2) {
-          messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
+        if (looksCall && malformedRetries++ < 2) {
+          // Also cover a call to a tool DROPPED up front (clangd symbol tools on a UE tree with no compile DB):
+          // that name is not in validNames, so the parser skipped it and the raw `search_symbol {…}` string
+          // shipped verbatim as the "answer" (live UE dogfood). Nudge a malformed valid call to re-emit; tell a
+          // call to an unavailable tool what IS available so the model can recover.
+          const nm = looksCall[1];
+          messages.push({ role: "user", content: validNames.has(nm)
+            ? `Your last message looks like a ${nm} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.`
+            : `"${nm}" is NOT an available tool for this project — available tools: ${[...validNames].join(", ")}. Re-issue your search using one of those, or give your final answer as path:line lines.` });
           continue;
         }
         // Empty final content (model ran a tool then gave no answer — common when a query is too complex for
         // the small model): salvage the locations already sitting in the tool results instead of shipping a
-        // silent "(no answer)". Only falls back when the model produced no real text of its own.
-        const finalRaw = (msg.content && msg.content.trim()) ? msg.content : (salvageLocs(executed) || "(no answer)");
+        // silent "(no answer)". Also never ship a bare tool-call string (`looksCall`) as the answer once the
+        // retries above are spent — the raw call text is noise to the caller.
+        const finalRaw = (msg.content && msg.content.trim() && !looksCall) ? msg.content : (salvageLocs(executed) || "(no answer)");
         const fin = finalize(finalRaw);
         const ans = fin.answer || "no match";
         const stats = { ms: Date.now() - t0, evalCount: totalEval, tokPerSec: totalEvalMs ? +(totalEval / (totalEvalMs / 1000)).toFixed(1) : 0, steps: step + 1, savings: savings(ans) };

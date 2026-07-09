@@ -950,14 +950,23 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
       // a raw call string to the caller as the "answer" (live, twice in one day). Give the model a
       // bounded number of corrective retries inside the same run instead.
       const looksCall = /^\s*([A-Za-z_]\w*)\s*:?\s*\{/.exec(msg.content || "");
-      if (looksCall && validNames.has(looksCall[1]) && malformedRetries++ < 2) {
-        messages.push({ role: "user", content: `Your last message looks like a ${looksCall[1]} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.` });
+      if (looksCall && malformedRetries++ < 2) {
+        // The nudge must also cover a call to a tool that was DROPPED up front (e.g. clangd symbol tools when a
+        // UE tree has no compile DB): that name is NOT in validNames, so the parser skipped it and — without
+        // this branch — the raw `search_symbol {…}` string shipped verbatim as the "answer" (live UE dogfood).
+        // A malformed call to a STILL-valid tool gets the "re-emit properly" nudge; a call to an unavailable
+        // tool gets told what IS available so the model can recover (def_search/search_text/find_files).
+        const nm = looksCall[1];
+        messages.push({ role: "user", content: validNames.has(nm)
+          ? `Your last message looks like a ${nm} tool call but it was MALFORMED and was NOT executed. Emit it again as a proper tool call with valid JSON arguments — or give your final answer as path:line lines.`
+          : `"${nm}" is NOT an available tool for this project — available tools: ${[...validNames].join(", ")}. Re-issue your search using one of those, or give your final answer as path:line lines.` });
         continue;
       }
       // Empty final content (the model ran a tool then gave no answer — common when a query is too complex
       // for the small model) → salvage the locations already in the tool results instead of a silent
-      // "(no answer)". Only falls back when the model produced no real text of its own.
-      const finalRaw = (msg.content && msg.content.trim()) ? msg.content : (salvageLocs(executed) || "(no answer)");
+      // "(no answer)". Also never ship a bare tool-call string (`looksCall`) as the answer: after the retries
+      // above are spent the model may still be emitting a call, and the raw call text is noise to the caller.
+      const finalRaw = (msg.content && msg.content.trim() && !looksCall) ? msg.content : (salvageLocs(executed) || "(no answer)");
       prog({ kind: "final", answer: finalRaw });
       return { answer: finalRaw, trace, acct, results: [...executed.values()] };
     }
