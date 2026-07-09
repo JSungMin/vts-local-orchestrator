@@ -139,6 +139,21 @@ export function verifyAnswerPaths(raw, results) {
   const blobLines = String((results || []).join("\n")).replace(/\\/g, "/").toLowerCase().split("\n").filter(Boolean);
   if (!blobLines.length || !String(raw || "").trim()) return { raw, droppedPaths: 0, droppedLines: 0 };
   let droppedPaths = 0, droppedLines = 0;
+  // Reconstruct the compacted `under <dir>/` header + BARE `file:line` data rows into full `dir/file:line`
+  // tokens BEFORE matching. A bare basename data line carries no directory, so a full-path answer could only
+  // reconcile by basename — which let a same-named file in a DIFFERENT dir donate its line numbers to a
+  // fabricated path (dogfood: result `Source/Game/PlayerController.cpp:53`, answer `Other/Deep/…:53` passed).
+  // Folding the header dir onto each bare row restores the directory so a wrong-dir answer no longer matches.
+  // The original bare rows are kept too, so a basename-ONLY answer (no dir to contradict) still reconciles.
+  const recon = [];
+  let curDir = "";
+  for (const bl of blobLines) {
+    const hm = bl.match(/^under (.+?)\/?$/);
+    if (hm) { curDir = hm[1].replace(/\/+$/, ""); recon.push(bl); continue; }
+    const dm = bl.match(/^\s*([^\s/:][^\s:]*):(\d+(?:,\d+)*)\b/);
+    if (dm && curDir && !dm[1].includes("/")) recon.push(curDir + "/" + dm[1] + ":" + dm[2]);
+    recon.push(bl);
+  }
   const kept = String(raw).split("\n").map((ln) => {
     const m = /^\s*(.+?):(\d+(?:,\d+)*)\s*$/.exec(ln);
     if (!m || !/[/\\.]/.test(m[1])) return ln;             // prose / non-location line → untouched
@@ -165,10 +180,13 @@ export function verifyAnswerPaths(raw, results) {
     };
     const nums = new Set();
     let carried = false;
-    for (const bl of blobLines) {
+    for (const bl of recon) {
       const byPath = numsAt(bl, p);
       const chosen = byPath.length ? byPath : (tail ? numsAt(bl, tail) : []);
-      const use = chosen.length ? chosen : numsAt(bl, base);
+      // The bare-basename fallback is DIRECTORY-BLIND, so gate it to a basename-only answer (segs.length === 1):
+      // when the answer names no directory there is nothing to contradict. A full/partial-path answer must match
+      // a reconstructed `dir/file` token — a wrong-dir path with a right basename no longer borrows line numbers.
+      const use = chosen.length ? chosen : (segs.length === 1 ? numsAt(bl, base) : []);
       if (use.length) { carried = true; for (const n of use) nums.add(n); }
     }
     if (!carried) { droppedPaths++; return null; } // path never appeared as a numbered location in any result
