@@ -255,9 +255,31 @@ async function defSearch(client, args, project) {
     if (!hits.length && !rs.timeBoxed && broad.length) hits = declOnly((await runCombined(broad, wider, WIDEN_GLOB)).hits);
     return hits.length ? format(hits, `— in the wider cluster root (outside ${path.basename(project)}; likely engine/shared)`) : null;
   };
+  // ESCALATE-ON-TIMEOUT — the text walk aborts mid-tree on a giant cluster; the committed-index decl tools are
+  // index-backed (no text-walk budget) and return the declaration where the walk can't finish. Try them before
+  // a false "inconclusive"/"no match", in CODE (not relying on the small model to follow the hint). Mirrors
+  // vts-bridge.mjs tryIndexDecl. search_symbol (`q`) = pure decl; find_references (`symbol`) = decl + refs.
+  const tryIndexDecl = async () => {
+    for (const a of [
+      { name: "search_symbol", args: { q: sym, projectPath: project } },
+      { name: "find_references", args: { symbol: sym, projectPath: project } },
+    ]) {
+      let out;
+      try {
+        const rr = await client.callTool({ name: a.name, arguments: a.args });
+        if (rr.isError) continue;
+        out = (rr.content || []).map((x) => (x.type === "text" ? x.text : "")).join("\n");
+      } catch { continue; }
+      const decls = declOnly(parseHits(out));
+      if (decls.length) return format(decls, `— via ${a.name} committed index (text scan timed out; the index is authoritative)`);
+    }
+    return null;
+  };
   let r = await runCombined(specific, project);
   if (r.hits.length) return format(r.hits);
   if (r.timeBoxed) {
+    const idx = await tryIndexDecl();
+    if (idx) return idx;
     const src = sourceRoot();
     if (src) {
       const r2 = await runCombined(specific, src);

@@ -187,9 +187,13 @@ export function treeFileCount(root, { cap = 40000, budgetMs = 1500 } = {}) {
 // 12s); a bigger tree scales up to QVTS_TEXT_TIMEBOX_MAX_MS (default 40s). Returns { ms, count, capped } so the
 // caller can log WHY it chose that budget. Only meaningful in the unindexed/fast-fail path (indexed trees use 4s).
 export function dynamicTextTimebox(root, { floorMs = 12000 } = {}) {
-  const max = Number(process.env.QVTS_TEXT_TIMEBOX_MAX_MS || 40000);
+  // A giant UE/monorepo cluster (100k+ files) aborted the walk mid-tree even at the old 40s cap → false
+  // "no match" on a real engine symbol (live: FMeshReductionSettings). Raise the ceiling (60s) and the large
+  // tier (30s) so a huge tree gets a real chance to finish; index-backed escalation still covers what a walk
+  // can't. Override with QVTS_TEXT_TIMEBOX_MAX_MS / QVTS_TEXT_TIMEBOX_MS.
+  const max = Number(process.env.QVTS_TEXT_TIMEBOX_MAX_MS || 60000);
   const { count, capped } = treeFileCount(root);
-  let ms = capped ? max : count >= 15000 ? 24000 : floorMs; // huge → max; large → 24s; else floor 12s
+  let ms = capped ? max : count >= 15000 ? 30000 : floorMs; // huge → max(60s); large → 30s; else floor 12s
   ms = Math.min(Math.max(ms, floorMs), max);
   return { ms, count, capped };
 }

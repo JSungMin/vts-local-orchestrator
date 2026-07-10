@@ -553,13 +553,43 @@ async function defSearch(client, args) {
     }
     return null;
   };
+  // ESCALATE-ON-TIMEOUT — when the text walk is time-boxed and aborts mid-tree (a giant UE/monorepo cluster),
+  // the committed-index decl tools are index-backed (no text-walk budget) and return the declaration in
+  // O(index) where the walk can't finish. Try them before surrendering to a false "inconclusive"/"no match" —
+  // this is exactly the escalation vs-search's own result text advises ("find_references is semantic +
+  // COMPLETE"), done in CODE so it doesn't depend on the small model choosing to follow the hint. search_symbol
+  // (`q`) yields the pure declaration; find_references (`symbol`) resolves decl + refs. Unavailable/empty index
+  // → null, fall through to the text-scoped path. Call-sites are dropped so only real decls surface.
+  const tryIndexDecl = async () => {
+    const attempts = [
+      { name: "search_symbol", args: { q: sym, projectPath: PROJECT } },
+      { name: "find_references", args: { symbol: sym, projectPath: PROJECT } },
+    ];
+    for (const a of attempts) {
+      let out;
+      try {
+        const r = await client.callTool({ name: a.name, arguments: a.args });
+        if (r.isError) continue;
+        out = (r.content || []).map((x) => (x.type === "text" ? x.text : "")).join("\n");
+      } catch { continue; }
+      const decls = declOnly(parseHits(out));
+      if (decls.length) {
+        process.stderr.write(`  · def_search: text walk timed out → recovered ${decls.length} decl(s) via ${a.name} (committed index)\n`);
+        return format(decls, `— via ${a.name} committed index (text scan timed out; the index is authoritative)`);
+      }
+    }
+    return null;
+  };
 
   // 1) specific patterns, combined, on the whole tree.
   let r = await runCombined(specific, PROJECT);
   process.stderr.write(`  · def_search[${lang || "auto"}] specific×${specific.length} @ tree → ${r.hits.length ? `${r.hits.length} hit(s)` : r.timeBoxed ? "(timeout)" : "(0)"}\n`);
   if (r.hits.length) return format(r.hits);
-  // 2) timed out (inconclusive) → retry scoped to the source root where the scan completes.
+  // 2) timed out (inconclusive) → escalate to the index-backed decl tools FIRST (no text-walk budget), then
+  // retry scoped to the source root where the scan completes.
   if (r.timeBoxed) {
+    const idx = await tryIndexDecl();
+    if (idx) return idx;
     const src = sourceRoot();
     if (src) {
       process.stderr.write(`  · def_search: tree scan timed out → retry scoped to ${src}\n`);
