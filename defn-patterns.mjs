@@ -15,6 +15,7 @@
  * Pure Node, no deps. Regexes are written for vs-search's default engine (ERE-ish: no lookaround/backrefs).
  */
 import fs from "node:fs";
+import path from "node:path";
 
 const EXT_LANG = {
   c: "c", h: "cpp", hpp: "cpp", hh: "cpp", hxx: "cpp", inl: "cpp",
@@ -39,7 +40,16 @@ export function detectLang(project) {
   try { ents = fs.readdirSync(project); } catch { return null; }
   const has = (re) => ents.some((e) => re.test(e));
   if (has(/\.uproject$/i)) return "cpp";
-  if (has(/\.sln$/i) || has(/\.csproj$/i)) return "csharp";
+  // A UE / C++ cluster root carries a generated `.sln` AND C# BUILD scripts (*.Build.cs / *.Target.cs) — neither
+  // means the codebase is C#. Detect the C++/UE signal (an Engine/ or Source/ dir, or a `.uproject` one level
+  // down) BEFORE the C#-project rule, and treat `.sln` as language-NEUTRAL (dropped as a csharp signal). Without
+  // this, a "where is <C++ symbol>" locate on a UE cluster ran with C# patterns → a false authoritative
+  // "no match" (live: MAX_STATIC_MESH_LODS, a `#define` in the engine — 3 C# patterns, none matched).
+  const subHasUproject = () => ents.some((e) => {
+    try { const p = path.join(project, e); return fs.statSync(p).isDirectory() && fs.readdirSync(p).some((f) => /\.uproject$/i.test(f)); } catch { return false; }
+  });
+  if (ents.includes("Engine") || ents.includes("Source") || subHasUproject()) return "cpp";
+  if (has(/\.csproj$/i)) return "csharp"; // a genuine C# project; `.sln` alone is language-neutral
   if (has(/^tsconfig.*\.json$/i)) return "ts";
   if (has(/^Cargo\.toml$/i)) return "rust";
   if (has(/^go\.mod$/i)) return "go";
@@ -84,8 +94,16 @@ export function definitionSearches(name, lang) {
       // the first `>`, so a NESTED template member (`TMultiMap<TObjectPtr<UObj>, FName> Name;`) failed to
       // match and def_search returned a confident "no declaration" for a symbol sitting right in the scanned
       // header (live dogfood miss). `;{}` can't appear inside template args, so greedy-to-last-`>` is safe.
-      add(`^\\s*(UPROPERTY\\s*\\([^)]*\\)\\s*)?(uint8|uint16|uint32|uint64|int8|int16|int32|int64|int|float|double|bool|FString|FName|FText|[A-Z]\\w+(<[^;{}]*>)?|[A-Za-z_]\\w*\\s*[*&])\\s+\\*?&?${N}\\s*(\\[[^\\]]*\\])?\\s*(=[^;]*)?;`, "field", true);
+      add(`(UPROPERTY\\s*\\([^)]*\\)\\s*)?\\b(uint8|uint16|uint32|uint64|int8|int16|int32|int64|int|float|double|bool|FString|FName|FText|[A-Z]\\w+(<[^;{}]*>)?|[A-Za-z_]\\w*\\s*[*&])\\s+\\*?&?${N}\\s*(\\[[^\\]]*\\])?\\s*(=[^;]*)?;`, "field", true);
       add(`\\b${N}\\s*\\([^;{]*\\)\\s*(const)?\\s*\\{`, "function-def", false); // body, not a prototype
+      // MACRO / CONSTANT: an ALL_CAPS engine constant is usually a `#define NAME …` or a `constexpr/const NAME =`,
+      // which NONE of the type/enum/function/field patterns above match — def_search returned a false
+      // authoritative "no match" for a real `#define` (live: MAX_STATIC_MESH_LODS). NO `^` line anchor: search_text
+      // matches the whole file WITHOUT a per-line multiline flag, so a `^`-anchored pattern only hits a decl on
+      // the file's FIRST line (verified — `^\s*#\s*define` returned 0 on a line-3 `#define`). `#define` and the
+      // const/constexpr/static keyword are distinctive enough to anchor without `^`.
+      add(`#\\s*define\\s+${N}\\b`, "macro", true);
+      add(`\\b(constexpr|const|static)\\b[\\w:<>*&\\s]*\\b${N}\\s*[=;]`, "value", true);
       add(`\\b${N}\\s*\\(`, "function-decl", false);
       break;
     case "csharp":
@@ -104,7 +122,9 @@ export function definitionSearches(name, lang) {
       add(`\\b${N}\\s*[:=]\\s*(async\\s*)?(function|\\()`, "func-expr", false);
       break;
     case "python":
-      add(`^\\s*(class|def|async\\s+def)\\s+${N}\\b`, "class/def", false);
+      // `\b` not `^` — search_text matches the whole file without a per-line multiline flag, so a `^`-anchored
+      // pattern only hits a def on the file's first line. `\b(class|def)` still blocks `subclass`/`undefine`.
+      add(`\\b(class|def|async\\s+def)\\s+${N}\\b`, "class/def", false);
       break;
     case "go":
       add(`type\\s+${N}\\b`, "type", false);
