@@ -176,6 +176,10 @@ function widenRoot(project) {
 // def_search — synthetic deterministic declaration locator over search_text (see vts-bridge.mjs). Tries the
 // language's definition regexes in priority order and returns the first that matches.
 const TIME_BOXED = /time-box hit|time-boxed|NOT conclusive|INCONCLUSIVE/i;
+// MCP request timeout must exceed the text-walk budget so a time-boxed search_text partial isn't lost to a
+// -32001. Mirror of vts-bridge.mjs.
+const MCP_TEXT_TIMEOUT = Number(process.env.QVTS_MCP_TIMEOUT_MS || 120000);
+const TEXT_SCAN_TOOLS = new Set(["search_text", "find_files", "concept_search"]);
 // Strip search_text's model-facing chrome (steer / completeness cert / log hint / savings line) — inside
 // def_search it's pure context waste; we want just the declaration hits. Mirrors vts-bridge.mjs.
 function stripVtsChrome(text) {
@@ -226,7 +230,7 @@ async function defSearch(client, args, project) {
     if (glob) callArgs.glob = glob;
     let out;
     try {
-      const r = await client.callTool({ name: "search_text", arguments: callArgs });
+      const r = await client.callTool({ name: "search_text", arguments: callArgs }, undefined, { timeout: MCP_TEXT_TIMEOUT });
       out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
       if (r.isError) return { hits: [], timeBoxed: false };
     } catch { return { hits: [], timeBoxed: false }; }
@@ -297,6 +301,11 @@ async function defSearch(client, args, project) {
   if (rb.length) return format(rb);
   const w = await tryWider();
   if (w) return w;
+  // COMPLETE-empty is NOT authoritative under a lang misdetect (C# patterns on a UE/C++ tree) or an unpatterned
+  // decl kind (a `#define` / enum value): the committed index is language-agnostic → try it before a false
+  // "no match". Mirror of vts-bridge.mjs.
+  const idxE = await tryIndexDecl();
+  if (idxE) return idxE;
   return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative)${wider ? `, including the wider cluster root ${wider}` : ""}.`;
 }
 
@@ -607,7 +616,8 @@ export async function createAgent({ onEvent = () => {} } = {}) {
             onEvent({ type: "tool_call", tool: name, args, dup: false });
             const _t0 = Date.now();
             try {
-              const out = await client.callTool({ name, arguments: args });
+              const opts = TEXT_SCAN_TOOLS.has(name) ? { timeout: MCP_TEXT_TIMEOUT } : undefined;
+              const out = await client.callTool({ name, arguments: args }, undefined, opts);
               resultText = (out.content || []).map((c) => (c.type === "text" ? c.text : JSON.stringify(c))).join("\n");
               if (out.isError) { resultText = `TOOL ERROR:\n${resultText}`; ok = false; }
             } catch (e) { resultText = `TOOL EXCEPTION: ${e.message}`; ok = false; }

@@ -464,6 +464,12 @@ function stripVtsChrome(text) {
     .trim();
 }
 const TIME_BOXED = /time-box hit|time-boxed|NOT conclusive|INCONCLUSIVE/i;
+// The MCP request timeout must EXCEED the text-walk time-box. A time-boxed search_text runs up to
+// VTS_TEXT_TIMEBOX_MS (now as high as 60s) and returns a PARTIAL result, but if the MCP request itself times
+// out first (SDK default ~60s) the call fails with -32001 and the partial is lost (live: a giant-cluster
+// search_text -32001'd right after the budget was raised to 60s). Give text scans a generous MCP ceiling.
+const MCP_TEXT_TIMEOUT = Number(process.env.QVTS_MCP_TIMEOUT_MS || 120000);
+const TEXT_SCAN_TOOLS = new Set(["search_text", "find_files", "concept_search"]);
 async function defSearch(client, args) {
   const sym = String(args.name || args.symbol || args.q || "").trim();
   if (!sym) return "def_search needs a 'name' (the symbol/type/function to locate the declaration of).";
@@ -510,7 +516,7 @@ async function defSearch(client, args) {
     if (glob) callArgs.glob = glob;
     let out;
     try {
-      const r = await client.callTool({ name: "search_text", arguments: callArgs });
+      const r = await client.callTool({ name: "search_text", arguments: callArgs }, undefined, { timeout: MCP_TEXT_TIMEOUT });
       out = (r.content || []).map((x) => (x.type === "text" ? x.text : JSON.stringify(x))).join("\n");
       if (r.isError) return { hits: [], timeBoxed: false, errored: true };
     } catch (e) {
@@ -612,6 +618,12 @@ async function defSearch(client, args) {
   // 4) no real declaration under PROJECT → widen to the cluster root (engine/sibling-package decl lives outside).
   const w = await tryWider();
   if (w) return w;
+  // 5) still empty — but a COMPLETE-empty text scan is NOT authoritative when the language was misdetected
+  // (C# patterns on a UE/C++ cluster) or the decl kind isn't pattern-covered (a `#define` / enum value). The
+  // committed index is language-AGNOSTIC, so try it before declaring a false "no match" (live: MAX_STATIC_MESH_LODS
+  // on a UE cluster misdetected as C#). Empty index → the honest text-based no-match stands.
+  const idxE = await tryIndexDecl();
+  if (idxE) return idxE;
   return `no match — def_search(${sym}) tried ${cands.length} definition pattern(s) for lang=${lang || "auto"} (scan COMPLETE, authoritative)${WIDER_ROOT ? `, including the wider cluster root ${WIDER_ROOT}` : ""}. The name may be spelled differently or absent; try search_text with a short fragment, or find_files for the likely file.`;
 }
 
@@ -1082,7 +1094,12 @@ async function runAgent(client, toolSchemas, ollamaTools, task, history, onProgr
           prog({ kind: "tool", tool: name, args });
           const _t0 = Date.now();
           try {
-            const out = await client.callTool({ name, arguments: args });
+            // A text-scan tool can run up to the raised text-walk budget (~60s) and return a time-boxed partial;
+            // give it an MCP request ceiling ABOVE that budget so the request doesn't -32001 before the partial
+            // arrives (live: the model's own search_text on a giant cluster failed with MCP -32001). Index/clangd
+            // tools keep the SDK default so a hung semantic call is still bounded.
+            const opts = TEXT_SCAN_TOOLS.has(name) ? { timeout: MCP_TEXT_TIMEOUT } : undefined;
+            const out = await client.callTool({ name, arguments: args }, undefined, opts);
             resultText = (out.content || [])
               .map((c) => (c.type === "text" ? c.text : JSON.stringify(c)))
               .join("\n");
