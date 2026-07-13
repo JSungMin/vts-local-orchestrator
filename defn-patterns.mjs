@@ -140,9 +140,14 @@ export function definitionSearches(name, lang) {
       add(`(fn\\s+${N}\\b|type\\s+${N}\\b|(const|static)\\s+${N}\\b)`, "item", false);
       break;
     default:
-      // language-agnostic best effort
+      // language-agnostic best effort — also covers an UNMARKED C/C++ tree (a bare `Source/` dir handed in as a
+      // scoped root detects no language, so it lands here): include the `#define`/const macro pattern so an
+      // ALL_CAPS engine constant is still found (live: MAX_STATIC_MESH_LODS under a scoped Engine/Source that
+      // detected `auto` → the 2 generic patterns had no macro rule → false "no match").
       add(`(class|struct|interface|enum|type|trait|record)\\s+${P}\\b`, "type", true);
       add(`(def|func|fn|function)\\s+${N}\\b`, "func", false);
+      add(`#\\s*define\\s+${N}\\b`, "macro", true);
+      add(`\\b(constexpr|const|static|final|val|let)\\b[\\w:<>*&\\s]*\\b${N}\\s*[=;]`, "value", true);
       add(`\\b${N}\\s*\\(`, "callable", false);
   }
   return out;
