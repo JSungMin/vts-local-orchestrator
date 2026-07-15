@@ -36,7 +36,10 @@ if ($vram -le 0) { Write-Warning "no NVIDIA GPU detected — model will run on C
 # (fast + accurate locator); qwen variants are for heavier GPUs / benchmarking. Pick with -Model.
 $models = @{
   gemma4  = @{ base="gemma4:e4b";                        tag="gemma4-vts";     file="Modelfile.gemma4" }
-  qwen14b = @{ base="qwen2.5-coder:14b-instruct-q4_K_M"; tag="qwen-coder-vts"; file="Modelfile.qwen25-14b" }
+  # NB: `qwen-coder-14b-vts`, NOT `qwen-coder-vts` — setup-macos.sh builds the 7B under the latter tag on a
+  # low-RAM Mac, and the 7B is the variant that fails symbol-declaration search (0/6). One tag meaning two
+  # different models across platforms made "which qwen is installed?" unanswerable from `ollama list`.
+  qwen14b = @{ base="qwen2.5-coder:14b-instruct-q4_K_M"; tag="qwen-coder-14b-vts"; file="Modelfile.qwen25-14b" }
   qwen3   = @{ base="qwen3:8b";                          tag="qwen3-vts";      file="Modelfile.qwen3" }
 }
 if (-not $models.ContainsKey($Model)) { throw "unknown -Model '$Model'. One of: $($models.Keys -join ', ')" }

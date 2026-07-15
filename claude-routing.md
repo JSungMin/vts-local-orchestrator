@@ -37,6 +37,8 @@ search output stays in the free local model. Command: `qvts` (installed at `~/.l
 Rule of thumb: **"find / count / list" → the local model, "judge / design / fix" → Claude.**
 
 Prereq (this machine): `vts-local-orchestrator/setup-macos.sh` has run and `qvts.config.json` written.
-Default model is `gemma4-vts` (benchmarked the most accurate locator on this 16 GB M4; the old 7B
-`qwen-coder-vts` reproducibly failed symbol-declaration searches). `ollama ps` → 100% GPU.
+Default model is `gemma4-vts`, and it should stay that way — benchmarked the most accurate locator on this
+16 GB M4 (8/8 on "where is X declared", 7–12 s). `qwen-coder-vts` (the 7B built by setup-macos.sh's low-RAM
+fallback) reproducibly failed symbol-declaration searches; qwen 14B (`qwen-coder-14b-vts`) is accurate but
+2–4× slower and memory-tight. `ollama ps` → 100% GPU.
 See ORCHESTRATION.md / USAGE.md.
