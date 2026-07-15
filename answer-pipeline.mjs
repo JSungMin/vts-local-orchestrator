@@ -251,11 +251,38 @@ export function stripCtrlTokens(s) {
 // to bare `path:line(s)`: strip a leading list marker, strip the trailing `: <source text>`, and drop a pure
 // markdown header / bold symbol label. Bare locations, `note:`, `no match`, and prose pass through. Run
 // BEFORE the fabrication guard so those lines become verifiable, and before groupLocLines so they compact.
+// ONE location token: `path:12` / `path:12,13` / a Windows-absolute `G:/dir/File.h:12` (the leading drive
+// colon must be matched explicitly — `[^\s:]+` alone stops at it).
+const LOC_TOKEN = /^((?:[A-Za-z]:)?[^\s:]+):(\d+(?:,\d+)*)$/;
+// A line that is NOTHING BUT >= 2 whitespace-separated location tokens → those tokens; else null.
+// All-or-nothing on purpose: if ANY token isn't a location the line is prose/mixed and we leave it alone, so
+// `path:214: some source text` (a location trailed by code, which contains spaces) never trips this.
+function splitLocRun(line) {
+  const toks = line.trim().split(/\s+/);
+  if (toks.length < 2) return null;
+  const out = [];
+  for (const t of toks) {
+    const m = LOC_TOKEN.exec(t);
+    if (!m || !/[/\\.]/.test(m[1])) return null; // not a pure run of locations
+    out.push(`${m[1]}:${m[2]}`);
+  }
+  return out;
+}
 export function normalizeLocLines(s) {
   const out = [];
   for (const ln of String(s).split("\n")) {
     const t = ln.replace(/^\s*(?:[-*+]|\d+\.)\s+/, "");            // drop a leading markdown list marker
     if (/^\s*#{1,6}\s/.test(t) || /^\s*\*\*.+\*\*\s*$/.test(t)) continue; // drop a header / bold symbol label
+    // MULTI-LOCATION LINE. Every helper here is LINE-oriented — each assumes at most ONE `path:line` per line —
+    // so a model that lists every hit on a SINGLE space-separated line slips past all of them: groupLocLines'
+    // `(.+?):(\d+)$` greedily swallows the whole line as one "path" ending at the LAST number, counts 1 file for
+    // 1 line, and returns it untouched — no grouping, no prefix strip. The pipeline was shaped around gemma4,
+    // which emits one-per-line (verified: 46 hits → one grouped relative line); qwen2.5-coder emitted 12 full
+    // absolute paths on ONE line and the whole pipeline no-op'd, shipping the raw paths to the caller. The
+    // prompt asks for the compact form, but a small model obeying it is not something to rely on — split here
+    // so grouping/relativising work whatever shape the model chose.
+    const run = splitLocRun(t);
+    if (run) { out.push(...run); continue; }
     const m = /^\s*(.+?):(\d+(?:\s*,\s*\d+)*)\s*(?::.*)?$/.exec(t); // path:nums optionally trailed by ": <text>"
     if (m && /[/\\.]/.test(m[1])) { out.push(`${m[1].trim()}:${m[2].replace(/\s+/g, "")}`); continue; }
     out.push(ln);                                                  // not a location line → untouched
