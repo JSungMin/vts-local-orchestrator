@@ -23,10 +23,11 @@ const ok = (name, cond, got) => {
 console.log("answer-pipeline selftest\n");
 
 // --- MULTI-LOCATION LINE (the regression this file was created for) -------------------------------------
-// Live: qwen2.5-coder answered with every hit on ONE space-separated line of ABSOLUTE paths. Every helper is
+// Live: the model answered with every hit on ONE space-separated line of ABSOLUTE paths. Every helper is
 // line-oriented, so groupLocLines read the whole line as a single "path" ending at the last number and passed
-// it through: no grouping, no prefix strip — the raw absolute paths shipped to the caller. gemma4 emits
-// one-per-line and was unaffected, which is exactly why this hid: the pipeline was shaped around one model.
+// it through: no grouping, no prefix strip — the raw absolute paths shipped to the caller. The same configured
+// model (gemma4-vts) emits one-per-line on other runs, which is exactly why this hid: the pipeline was built
+// against the shape a run happened to produce, not against every shape the model can produce.
 {
   const P = "G:/proj/App";
   const oneLine =
@@ -47,9 +48,10 @@ console.log("answer-pipeline selftest\n");
 }
 
 // --- ECHOED `file:line` CONTRACT HEADER ----------------------------------------------------------------
-// Live (qwen2.5-coder, after the one-line fix): the model prefixed its answer with the literal contract label
-// `file:line`. It's not a location, and groupLocLines only groups when EVERY line is one — so that single
-// header row stopped 19 real hits from collapsing and `server/core.js` repeated on all 19 lines.
+// Live (after the one-line fix): the model prefixed its answer with the literal contract label `file:line`.
+// It's not a location, and groupLocLines only groups when EVERY line is one — so that single header row
+// stopped 19 real hits from collapsing and `server/core.js` repeated on all 19 lines. Same model, one run
+// later: a different shape again. Normalise deterministically; never assume the previous run's shape holds.
 {
   const s = "file:line\nsrc/a.js:1\nsrc/a.js:2\nsrc/b.js:9";
   const out = groupLocLines(normalizeLocLines(s));

@@ -15,7 +15,7 @@
  *
  * Env overrides (else from qvts.config.json, written by setup.ps1):
  *   OLLAMA_HOST     default http://127.0.0.1:11434
- *   QVTS_MODEL      default qwen-coder-vts
+ *   QVTS_MODEL      default gemma4-vts  (matches config-loader.mjs; benchmarked best — see README)
  *   VTS_SERVER      path to vs-token-safer/server/index.js (else auto-resolved)
  *   VTS_PROJECT     default: read from ~/.vs-token-safer/config.json projectPath
  *   QVTS_MAXSTEPS   default 25  (tool-call rounds before giving up)

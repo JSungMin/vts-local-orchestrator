@@ -283,10 +283,10 @@ export function normalizeLocLines(s) {
     // MULTI-LOCATION LINE. Every helper here is LINE-oriented — each assumes at most ONE `path:line` per line —
     // so a model that lists every hit on a SINGLE space-separated line slips past all of them: groupLocLines'
     // `(.+?):(\d+)$` greedily swallows the whole line as one "path" ending at the LAST number, counts 1 file for
-    // 1 line, and returns it untouched — no grouping, no prefix strip. The pipeline was shaped around gemma4,
-    // which emits one-per-line (verified: 46 hits → one grouped relative line); qwen2.5-coder emitted 12 full
-    // absolute paths on ONE line and the whole pipeline no-op'd, shipping the raw paths to the caller. The
-    // prompt asks for the compact form, but a small model obeying it is not something to rely on — split here
+    // 1 line, and returns it untouched — no grouping, no prefix strip, raw absolute paths shipped to the caller.
+    // The shape is not stable per model: the SAME configured model (gemma4-vts) produced one-per-line on one run
+    // (46 hits → one grouped relative line) and a single space-separated run of 12 absolute paths on another.
+    // The prompt asks for the compact form, but a small model obeying it is not something to rely on — split here
     // so grouping/relativising work whatever shape the model chose.
     const run = splitLocRun(t);
     if (run) { out.push(...run); continue; }
