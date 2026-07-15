@@ -273,6 +273,13 @@ export function normalizeLocLines(s) {
   for (const ln of String(s).split("\n")) {
     const t = ln.replace(/^\s*(?:[-*+]|\d+\.)\s+/, "");            // drop a leading markdown list marker
     if (/^\s*#{1,6}\s/.test(t) || /^\s*\*\*.+\*\*\s*$/.test(t)) continue; // drop a header / bold symbol label
+    // The prompt states the contract as `file:line`; a small model often echoes that LITERAL label as the first
+    // row of its answer. It carries no information, and it is not a location (no digits) — which is fatal here,
+    // because groupLocLines only groups when EVERY line is a location (rightly: a prose answer must not be
+    // mangled). So one echoed header stops the whole answer from compacting: live, 19 real hits kept repeating
+    // `server/core.js` per line instead of collapsing to one `path:l1,l2,…`. Drop it. Narrow on purpose — only
+    // the literal words, so a real file named `file` or any prose is untouched.
+    if (/^\s*(?:\*\*)?file\s*:\s*lines?(?:\(s\))?(?:\*\*)?\s*$/i.test(t)) continue;
     // MULTI-LOCATION LINE. Every helper here is LINE-oriented — each assumes at most ONE `path:line` per line —
     // so a model that lists every hit on a SINGLE space-separated line slips past all of them: groupLocLines'
     // `(.+?):(\d+)$` greedily swallows the whole line as one "path" ending at the LAST number, counts 1 file for

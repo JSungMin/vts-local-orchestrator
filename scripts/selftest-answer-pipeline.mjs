@@ -46,6 +46,24 @@ console.log("answer-pipeline selftest\n");
   ok("drive-letter tokens survive the split", out === "G:/a/F.h:10\nG:/a/F.h:20", out);
 }
 
+// --- ECHOED `file:line` CONTRACT HEADER ----------------------------------------------------------------
+// Live (qwen2.5-coder, after the one-line fix): the model prefixed its answer with the literal contract label
+// `file:line`. It's not a location, and groupLocLines only groups when EVERY line is one — so that single
+// header row stopped 19 real hits from collapsing and `server/core.js` repeated on all 19 lines.
+{
+  const s = "file:line\nsrc/a.js:1\nsrc/a.js:2\nsrc/b.js:9";
+  const out = groupLocLines(normalizeLocLines(s));
+  ok("echoed `file:line` header dropped → answer groups", out === "src/a.js:1,2\nsrc/b.js:9", out);
+}
+{
+  ok("bold/plural header variants dropped", normalizeLocLines("**File: Lines**\nsrc/a.js:1") === "src/a.js:1", normalizeLocLines("**File: Lines**\nsrc/a.js:1"));
+}
+{
+  // Narrow on purpose: a real path whose basename is `file` must survive.
+  const out = normalizeLocLines("src/file.js:12");
+  ok("a real path named file.js is not mistaken for the header", out === "src/file.js:12", out);
+}
+
 // --- the split must NOT eat legitimate non-location content --------------------------------------------
 {
   // A location trailed by SOURCE TEXT contains spaces but is not a run of locations.
