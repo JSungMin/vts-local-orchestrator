@@ -10,7 +10,8 @@
   "scripts": {
     "agent": "node vts-bridge.mjs",
     "deps": "node scripts/ensure-deps.mjs",
-    "secret-scan": "node scripts/secret-scan.mjs --tree"
+    "secret-scan": "node scripts/secret-scan.mjs --tree",
+    "test": "node scripts/selftest-answer-pipeline.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"
