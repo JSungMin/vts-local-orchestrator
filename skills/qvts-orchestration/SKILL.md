@@ -49,12 +49,19 @@ session hint — that hint optimizes for vs-token-safer's own tool usage, not fo
 
 The same token rule applies to INGESTING text, not only searching for it. When you'd otherwise `Read` a big
 file (or a whole module) just to survey/summarize/assess it — e.g. "which handlers spew large output", "what
-does this file do", "where's the risk in this diff" — DON'T pull the raw bytes into your context. Delegate the
-READ; only a compact brief returns:
+does this file do" — DON'T pull the raw bytes into your context. Delegate the READ; only a compact brief
+returns:
 
 - `qvts digest "<file>" --focus "<question>"` → shortest faithful brief (the local model reads the file).
 - `qvts digest-dir "<dir>" --focus "<question>"` → per-file briefs + an overview for a whole module.
 - `qvts triage-diff [--staged]` → a git diff → `{summary, hotspots[], open[]}` so you open only flagged files.
+  This is a CONTEXT-SAVING SUMMARY (the local model reads the diff), **NOT an impact analysis**. To judge a
+  change's BLAST RADIUS + a deterministic risk band (LOW/MED/HIGH, computed from the LSP call graph + git
+  co-change coupling), call **vs-token-safer's `detect_changes` MCP tool directly** — it is exact and
+  reproducible where triage-diff is an LLM summary. Split of labor: **triage-diff decides WHICH files to open;
+  `detect_changes` judges HOW RISKY the change is** ("is this safe to commit", "what does this touch", review).
+  `detect_changes` is a multi-step LSP+git+risk composition, not a single locate — never route it to the local
+  model (it can't drive it); Claude calls it directly.
 - `qvts vcs <p4|git> <read-only sub> [args] [--focus "..."]` → run a big version-control query (e.g.
   `qvts vcs p4 opened`, `qvts vcs git status`, `qvts vcs git log -20`) and get back a short summary instead of
   the raw dump. Read-only subcommands only (mutating p4/git ops are refused). Don't run `p4 opened` /
