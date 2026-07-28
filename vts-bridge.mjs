@@ -381,6 +381,54 @@ async function daemonFor(project) {
   return null;
 }
 
+// LAZY WARM-DAEMON. Without a daemon, every `qvts` locate spawns its OWN cold vs-search server (+clangd). During
+// active code search/edit the agent fires many locates, so on a big tree those cold servers PILE UP live —
+// dozens of node/clangd procs pegging CPU for tens of minutes (the reported swarm). The daemon fixes it: ONE
+// warm server serves every locate. So when a locate finds none up, START one and wait for it, and — critically
+// — guard the start with an ATOMIC lock so CONCURRENT locates converge on that single daemon instead of each
+// racing to cold-spawn. Default ON; opt out with --no-daemon or QVTS_LAZY_DAEMON=0. Only ever starts a daemon
+// for THIS project (a different -p still cold-spawns, by design). If the daemon doesn't answer /health within
+// the wait, the caller falls through to the normal per-call spawn (correctness preserved, just not warm).
+const LAZY_DAEMON = !/^(0|false|off|no)$/i.test(process.env.QVTS_LAZY_DAEMON ?? "1");
+const DAEMON_START_LOCK = process.env.QVTS_DAEMON_LOCK || path.join(os.homedir(), ".vts-local", "daemon-start.lock");
+const DAEMON_WAIT_MS = Number(process.env.QVTS_DAEMON_WAIT_MS || 20000);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function ensureDaemonUp(project) {
+  const existing = await daemonFor(project);
+  if (existing) return existing;
+  if (!LAZY_DAEMON || !project) return null;
+  // Atomic lock (exclusive create) so only ONE racing locate spawns the daemon; peers just poll for it. A lock
+  // older than 2× the wait is stale (a crashed starter) → steal it. Best-effort throughout — a lock hiccup
+  // must never break a locate.
+  let holdLock = false;
+  try {
+    fs.mkdirSync(path.dirname(DAEMON_START_LOCK), { recursive: true });
+    try { const st = fs.statSync(DAEMON_START_LOCK); if (Date.now() - st.mtimeMs > DAEMON_WAIT_MS * 2) fs.rmSync(DAEMON_START_LOCK, { force: true }); } catch { /* no lock yet */ }
+    const fd = fs.openSync(DAEMON_START_LOCK, "wx"); // throws if another locate already holds it
+    fs.writeSync(fd, String(process.pid)); fs.closeSync(fd);
+    holdLock = true;
+  } catch { holdLock = false; /* a peer is starting it → fall through to poll */ }
+  const release = () => { if (holdLock) { try { fs.rmSync(DAEMON_START_LOCK, { force: true }); } catch { /* ignore */ } holdLock = false; } };
+  if (holdLock) {
+    // `daemon start` is itself idempotent (no-op if one is already up); we hold the lock only to serialize the
+    // spawn, then poll like everyone else.
+    try {
+      spawn(process.execPath, [process.argv[1], "daemon", "start", "--project", project], {
+        detached: true, stdio: "ignore", env: { ...process.env, VTS_PROJECT: project },
+      }).unref();
+    } catch { release(); return null; }
+  }
+  const deadline = Date.now() + DAEMON_WAIT_MS;
+  try {
+    while (Date.now() < deadline) {
+      await sleep(500);
+      const st = await daemonFor(project);
+      if (st) { release(); return st; }
+    }
+  } finally { release(); }
+  return null; // didn't come up in time → caller uses the per-call cold path
+}
+
 // ---- MCP tool schema -> Ollama (OpenAI-style) tool ----
 function toOllamaTool(t) {
   return {
@@ -1548,7 +1596,7 @@ async function main() {
   // local port would add an arbitrary-file-read / SSRF surface. The daemon is OPTIONAL: if none is up,
   // control falls through to the normal per-call path. --no-daemon opts out.
   if (sub !== "daemon" && !process.env.QVTS_DAEMON_SERVE && !process.argv.includes("--no-daemon")) {
-    const st = await daemonFor(PROJECT);
+    const st = await ensureDaemonUp(PROJECT);
     const noCache = process.argv.includes("--no-cache");
     if (st && sub === "--batch") {
       let queries = null;
