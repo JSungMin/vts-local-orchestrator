@@ -337,8 +337,16 @@ function contentCachePut(kind, contentHash, extra, value) {
 // per-call latency. The daemon keeps ONE MCP+model session warm and serves locates over 127.0.0.1, so
 // repeat calls skip the cold spawn. It serves the project it was started with; calls for another project
 // fall back to a per-call spawn. Local-only; nothing transmitted.
-const DAEMON_FILE = process.env.QVTS_DAEMON_FILE || path.join(os.homedir(), ".vts-local", "daemon.json");
-const DAEMON_PORT = Number(process.env.QVTS_DAEMON_PORT || 7879);
+// PER-PROJECT daemon identity. A single fixed pidfile + fixed port meant ONE daemon could serve only ONE
+// project: a locate for a DIFFERENT repo never matched (daemonFor compares `project`), so with lazy start on,
+// EVERY such locate tried to start another daemon, which then collided on the fixed port and exited(1) — a
+// repeating spawn storm (start-launcher node + detached daemon node + its vs-search server, then a 20s wait
+// and a cold spawn anyway, per locate). Keying BOTH the pidfile and the port by the project gives each repo
+// its own warm daemon, so the mismatch (and the collision) cannot happen. Explicit QVTS_DAEMON_FILE /
+// QVTS_DAEMON_PORT still win, for a single-project pin or tests.
+const projKey = (p) => crypto.createHash("sha1").update(path.resolve(String(p || "default")).toLowerCase()).digest("hex").slice(0, 10);
+const DAEMON_FILE = process.env.QVTS_DAEMON_FILE || path.join(os.homedir(), ".vts-local", "daemons", `${projKey(PROJECT)}.json`);
+const DAEMON_PORT = Number(process.env.QVTS_DAEMON_PORT || 7879 + (parseInt(projKey(PROJECT).slice(0, 4), 16) % 97));
 const daemonRead = () => {
   try {
     return JSON.parse(fs.readFileSync(DAEMON_FILE, "utf8"));
@@ -390,13 +398,25 @@ async function daemonFor(project) {
 // for THIS project (a different -p still cold-spawns, by design). If the daemon doesn't answer /health within
 // the wait, the caller falls through to the normal per-call spawn (correctness preserved, just not warm).
 const LAZY_DAEMON = !/^(0|false|off|no)$/i.test(process.env.QVTS_LAZY_DAEMON ?? "1");
-const DAEMON_START_LOCK = process.env.QVTS_DAEMON_LOCK || path.join(os.homedir(), ".vts-local", "daemon-start.lock");
-const DAEMON_WAIT_MS = Number(process.env.QVTS_DAEMON_WAIT_MS || 20000);
+const DAEMON_START_LOCK = process.env.QVTS_DAEMON_LOCK || `${DAEMON_FILE}.lock`; // per-project, like the pidfile
+const DAEMON_WAIT_MS = Number(process.env.QVTS_DAEMON_WAIT_MS || 12000);
+// FAILURE COOLDOWN — a start that doesn't produce a healthy daemon (Ollama down, port taken, model missing…)
+// must NOT be retried by the very next locate: that is what turns one bad start into a spawn storm. Stamp the
+// failure and skip lazy start entirely until the cooldown expires; locates still work, they just take the
+// normal per-call path. Cleared as soon as a daemon is up.
+const DAEMON_COOLDOWN_MS = Number(process.env.QVTS_DAEMON_COOLDOWN_MS || 600000);
+const DAEMON_COOLDOWN_FILE = `${DAEMON_FILE}.cooldown`;
+const coolingDown = () => {
+  try { return Date.now() - fs.statSync(DAEMON_COOLDOWN_FILE).mtimeMs < DAEMON_COOLDOWN_MS; } catch { return false; }
+};
+const stampCooldown = () => { try { fs.mkdirSync(path.dirname(DAEMON_COOLDOWN_FILE), { recursive: true }); fs.writeFileSync(DAEMON_COOLDOWN_FILE, String(Date.now())); } catch { /* best-effort */ } };
+const clearCooldown = () => { try { fs.rmSync(DAEMON_COOLDOWN_FILE, { force: true }); } catch { /* ignore */ } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function ensureDaemonUp(project) {
   const existing = await daemonFor(project);
-  if (existing) return existing;
+  if (existing) { clearCooldown(); return existing; }
   if (!LAZY_DAEMON || !project) return null;
+  if (coolingDown()) return null; // a recent start failed — don't respawn on every locate
   // Atomic lock (exclusive create) so only ONE racing locate spawns the daemon; peers just poll for it. A lock
   // older than 2× the wait is stale (a crashed starter) → steal it. Best-effort throughout — a lock hiccup
   // must never break a locate.
@@ -416,17 +436,20 @@ async function ensureDaemonUp(project) {
       spawn(process.execPath, [process.argv[1], "daemon", "start", "--project", project], {
         detached: true, stdio: "ignore", env: { ...process.env, VTS_PROJECT: project },
       }).unref();
-    } catch { release(); return null; }
+    } catch { release(); stampCooldown(); return null; }
   }
   const deadline = Date.now() + DAEMON_WAIT_MS;
   try {
     while (Date.now() < deadline) {
       await sleep(500);
       const st = await daemonFor(project);
-      if (st) { release(); return st; }
+      if (st) { release(); clearCooldown(); return st; }
     }
   } finally { release(); }
-  return null; // didn't come up in time → caller uses the per-call cold path
+  // Didn't come up in time → the caller uses the per-call cold path, and we mark a cooldown so the NEXT
+  // locate doesn't spawn another start attempt (the storm). One failed start costs one attempt, not N.
+  stampCooldown();
+  return null;
 }
 
 // ---- MCP tool schema -> Ollama (OpenAI-style) tool ----
