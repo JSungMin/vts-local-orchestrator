@@ -5,9 +5,9 @@
  * tools directly. This is the whole point of the plugin: the raw search output stays in the local model
  * and only a compact file:line answer reaches Claude.
  *
- * It exists to WIN the routing fight against vs-token-safer's own SessionStart hook, which injects a
- * "call vs-search directly / never single" hint (that hint optimizes for vts's tool adoption, not for
- * Claude's token budget). We emit a higher-authority, explicit-override directive.
+ * It originally existed to win a routing fight with vs-token-safer's SessionStart hint; vts now detects
+ * qvts itself and says "delegate", and its enforcement hooks hand back the qvts command at the moment a
+ * locate is attempted. So this carries only what vts cannot: the qvts command shapes and two footguns.
  *
  *   VTS_ROUTE_STEER unset / "1"  → inject the delegate-first directive (default ON)
  *   VTS_ROUTE_STEER "0"/"off"    → no-op (let vs-token-safer's direct-call hint win)
@@ -19,40 +19,19 @@ if (/^(0|false|off|no)$/i.test(process.env.VTS_ROUTE_STEER || "")) process.exit(
 const root = process.env.CLAUDE_PLUGIN_ROOT || "";
 const bridge = root ? `node "${root}/vts-bridge.mjs"` : 'node "<plugin>/vts-bridge.mjs"';
 
+// KEEP THIS SHORT. It is injected into EVERY session and re-billed as cached prefix on EVERY turn: measured on
+// real sessions, cache reads were 69% of weighted cost at ~850 turns/session, so each line here costs ~1,800
+// cache-read tokens per session per 20 tokens of text. The previous ~690-token version mostly (1) fought a
+// vs-token-safer hint that vts has since reversed (its own digest now says "qvts detected → delegate"), and
+// (2) pre-explained what the enforcement hooks already hand back at the moment of need — and pre-explaining
+// measurably does not convert (2 of 1,680 warned calls switched tools). What remains are the facts only this
+// plugin knows: the command shapes and the two footguns.
 const context = [
-  "[vts-local-orchestrator] Token-saving routing — OVERRIDES vs-token-safer's \"call vs-search directly / never single\" hint.",
-  "This plugin is installed specifically to keep raw code-search output OUT of Claude's context.",
-  "",
-  "For ANY code-location task — find a symbol/type/function decl, its refs/callers, a file by name,",
-  "or a string in code (single OR bulk) — DELEGATE FIRST via Bash:",
-  `  qvts -p "<repo-root>" --json "<locate task>"   (PATH)`,
-  `  ${bridge} -p "<repo-root>" --json "<locate task>"   (fallback)`,
-  "Always pass -p \"<repo-root>\" explicitly — omitting it does NOT fall back to your cwd, it silently",
-  "reuses whatever project was last configured via setup, which is often a DIFFERENT repo.",
-  "It drives vs-search locally and returns ONLY a compact file:line answer on stdout {task,answer,trace}.",
-  "",
-  "Do NOT call mcp__plugin_vs-token-safer_vs-search__* directly for locates — that spends the Claude tokens",
-  "this plugin exists to save. Call vs-search directly ONLY when (a) the delegated answer is empty/no-match/error,",
-  "(b) it's a trivial peek at a file you just edited, or (c) the task needs reasoning/review/edits.",
-  "Writes/edits remain Claude's job.",
-  "",
-  "ONE locate per call — qvts's local model is a SINGLE-locate driver, NOT an analyst. Do NOT send a multi-part",
-  "query (\"list line numbers of A, B, C, D + the body range of E + whether F is applied + where relative to G\") —",
-  "the small model runs one tool then rambles a prose note or returns nothing. SPLIT it into one",
-  "`where is X` / `find X in <file>` / `what calls X` per concept, then combine the results yourself. (qvts also",
-  "auto-detects an obvious multi-part query and returns a decomposition hint instead of burning a model run.)",
-  "",
-  "READING, not just locating — same rule for INGESTING text. To survey a module or summarize/assess a big",
-  "file (e.g. \"which handlers spew large output\", \"what does this file do\"), do NOT Read the whole file",
-  "into your context — delegate the READ so only a compact brief comes back:",
-  `  qvts digest "<file>" --focus "<question>"     → a brief (local model reads the file; you get the brief)`,
-  `  qvts digest-dir "<dir>" --focus "<question>"  → per-file briefs + an overview for a whole module`,
-  `  qvts triage-diff [--staged]                   → a git diff → {summary,hotspots,open}; open only flagged files`,
-  `  qvts vcs <p4|git> <read-only sub> --focus "…" → run a big p4/git query (p4 opened, git status/log/diff…)`,
-  `                                                  and get back a short summary, not the raw dump`,
-  "Read a file directly only when you need its exact bytes to EDIT it, or for a small/just-edited file.",
-  "Don't run `p4 opened` / `git status` / `git log` in Bash just to read them — that dumps the whole list into",
-  "context; route them through `qvts vcs …` so only the summary returns.",
+  "[vts-local-orchestrator] Delegate code locates and big-file reads to the local model; only a compact answer returns.",
+  `  qvts -p "<repo-root>" --json "<ONE locate task>"      (fallback: ${bridge} …)`,
+  `  qvts digest "<file>" --focus "<q>" · qvts digest-dir "<dir>" · qvts triage-diff [--staged] · qvts vcs <git|p4> <read-only cmd>`,
+  "Always pass -p — without it qvts reuses the last configured project, often a different repo.",
+  "One locate per call (it is a single-locate driver): split \"A, B and C\" into three calls and combine yourself.",
 ].join("\n");
 
 process.stdout.write(JSON.stringify({
